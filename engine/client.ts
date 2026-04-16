@@ -283,11 +283,21 @@ export class PolymarketEarlyBirdClient implements EarlyBirdClient {
   }
 
   async init(): Promise<void> {
-    const creds = await new ClobClient(
+    const baseClient = new ClobClient(
       this._host,
       137,
       this._signer,
-    ).createOrDeriveApiKey();
+    );
+    const creds = await baseClient.createOrDeriveApiKey();
+    const signerAddress = await this._signer.getAddress();
+    if (process.env.DEBUG_ORDER_SIGNING === "true") {
+      console.log(JSON.stringify({
+        stage: "auth_identity",
+        signerAddress,
+        funder: this._funder,
+        creds,
+      }));
+    }
     this.clob = new ClobClient(
       this._host,
       137,
