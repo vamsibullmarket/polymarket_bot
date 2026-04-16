@@ -100,10 +100,11 @@ export async function placeBtc5mTrade(
     const tickSize = deps.orderBook.getTickSize(tokenId);
     const feeRateBps = deps.orderBook.getFeeRate(tokenId);
 
+    const price = Math.floor(ask.price / Number(tickSize)) * Number(tickSize);
     const fokOrder: MultiOrderRequest = {
       tokenId,
       action: "buy",
-      price: ask.price,
+      price,
       shares,
       tickSize,
       negRisk: event.negRisk,
@@ -135,10 +136,11 @@ export async function placeBtc5mTrade(
   const tickSize = deps.orderBook.getTickSize(tokenId);
   const feeRateBps = deps.orderBook.getFeeRate(tokenId);
 
+  const price = Math.floor(ask.price / Number(tickSize)) * Number(tickSize);
   const gtcOrder: MultiOrderRequest = {
     tokenId,
     action: "buy",
-    price: ask.price,
+    price,
     shares,
     tickSize,
     negRisk: event.negRisk,

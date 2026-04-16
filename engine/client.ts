@@ -293,7 +293,7 @@ export class PolymarketEarlyBirdClient implements EarlyBirdClient {
       137,
       this._signer,
       creds,
-      1, // Magic/Email login
+      0, // Browser wallet / EOA signer
       this._funder,
     );
   }
@@ -302,8 +302,7 @@ export class PolymarketEarlyBirdClient implements EarlyBirdClient {
   async postMultipleOrders(
     orders: MultiOrderRequest[],
   ): Promise<PlacedOrder[]> {
-    // Sign all orders in parallel, passing pre-fetched options to skip network calls
-    // This is fully offline
+    const debugSigning = Env.get("DEBUG_ORDER_SIGNING") === "true";
     const signed = await Promise.all(
       orders.map((req) => {
         const userOrder: UserOrder = {
@@ -313,27 +312,40 @@ export class PolymarketEarlyBirdClient implements EarlyBirdClient {
           side: req.action === "buy" ? Side.BUY : Side.SELL,
           feeRateBps: req.feeRateBps,
         };
-        return this.clob.orderBuilder.buildOrder(userOrder, {
+        const order = this.clob.orderBuilder.buildOrder(userOrder, {
           tickSize: req.tickSize as TickSize,
           negRisk: req.negRisk,
         });
+        if (debugSigning) {
+          console.log(JSON.stringify({
+            stage: "signed_order",
+            req,
+            userOrder,
+            order,
+          }));
+        }
+        return order;
       }),
     );
+
+    const postPayload = signed.map((order, i) => ({
+      order,
+      orderType:
+        orders[i]!.orderType === "FOK"
+          ? ClobOrderType.FOK
+          : ClobOrderType.GTC,
+    }));
+
+    if (debugSigning) {
+      console.log(JSON.stringify({ stage: "post_payload", postPayload }));
+    }
 
     const resp: Array<{
       orderID: string;
       status: string;
       success: boolean;
       errorMsg: string;
-    }> = await this.clob.postOrders(
-      signed.map((order, i) => ({
-        order,
-        orderType:
-          orders[i]!.orderType === "FOK"
-            ? ClobOrderType.FOK
-            : ClobOrderType.GTC,
-      })),
-    );
+    }> = await this.clob.postOrders(postPayload);
     return resp.map((r) => ({
       orderId: r.orderID,
       status: r.status,
