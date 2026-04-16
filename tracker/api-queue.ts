@@ -74,8 +74,11 @@ export class APIQueue {
       abort: controller.signal,
       resolveWhen: async (res) => {
         const data = (await res.json()) as MarketData;
-        if (data.openPrice) this.marketResult.set(slot.startTime, data);
-        if (!data.closePrice) throw new Error("Close price not set");
+        if (data.openPrice != null) {
+          this.marketResult.set(slot.startTime, data);
+          return data;
+        }
+        throw new Error("Open price not set yet");
       },
       retryBackOff: (currentRetry) => {
         // market data is set delay by 5s

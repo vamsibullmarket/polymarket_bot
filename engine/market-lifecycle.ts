@@ -94,6 +94,32 @@ export class MarketLifecycle {
   private readonly _ticker: TickerTracker;
   private readonly _alwaysLog: boolean;
 
+  private _getMarketResultWithFallback() {
+    const slot = slotFromSlug(this.slug);
+    const intervalMs = slot.endTime - slot.startTime;
+    const current = this.apiQueue.marketResult.get(slot.startTime);
+    if (current?.openPrice != null) return current;
+
+    for (let stepsBack = 1; stepsBack <= 4; stepsBack++) {
+      const prevSlotStart = slot.startTime - intervalMs * stepsBack;
+      const prev = this.apiQueue.marketResult.get(prevSlotStart);
+      if (prev?.openPrice != null) {
+        this.apiQueue.marketResult.set(slot.startTime, prev);
+        this._marketLogger.log({
+          type: "market_result_fallback",
+          slug: this.slug,
+          usedSlotStart: prevSlotStart,
+          currentSlotStart: slot.startTime,
+          openPrice: prev.openPrice,
+          fallbackDepth: stepsBack,
+        });
+        return prev;
+      }
+    }
+    return current ?? null;
+  }
+
+
   constructor(opts: MarketLifecycleOptions) {
     this.slug = opts.slug;
     this.apiQueue = opts.apiQueue;
@@ -235,8 +261,10 @@ export class MarketLifecycle {
 
     const slot = slotFromSlug(this.slug);
     const delayMs = Math.max(0, slot.startTime - Date.now());
+    const prevSlot = { startTime: slot.startTime - (slot.endTime - slot.startTime), endTime: slot.startTime };
     this._marketOpenTimer = setTimeout(() => {
       this._marketPriceHandle = this.apiQueue.queueMarketPrice(slot);
+      this.apiQueue.queueMarketPrice(prevSlot);
     }, delayMs);
 
     this._orderBook.subscribe(this._clobTokenIds);
@@ -250,8 +278,8 @@ export class MarketLifecycle {
       divergence: this._ticker.divergence,
     }));
     this._marketLogger.setMarketResultProvider(() => {
-      const data = this.apiQueue.marketResult.get(slot.startTime);
-      if (!data?.openPrice) return {};
+      const data = this._getMarketResultWithFallback();
+      if (data?.openPrice == null) return {};
       const assetPrice = this._ticker.price;
       const gap = assetPrice
         ? parseFloat((assetPrice - data.openPrice).toFixed(2))
@@ -296,8 +324,7 @@ export class MarketLifecycle {
       },
       ticker: this._ticker,
       getMarketResult: () => {
-        const slot = slotFromSlug(this.slug);
-        return this.apiQueue.marketResult.get(slot.startTime);
+        return this._getMarketResultWithFallback() ?? undefined;
       },
     };
 

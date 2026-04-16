@@ -2,6 +2,7 @@
 
 import type { Strategy, StrategyContext } from "./types.ts";
 import { Env } from "../../utils/config.ts";
+import { getSlug } from "../../utils/slot.ts";
 
 class RSI {
   private _period: number;
@@ -213,7 +214,102 @@ type LateEntryState = {
 // Constants
 // ---------------------------------------------------------------------------
 
-const SHARES = 6;
+const TARGET_ORDER_USD = 2;
+const NO_SIGNAL_LOG_INTERVAL_MS = 5_000;
+
+function explainNoSignal(params: {
+  remaining: number;
+  btcPrice?: number;
+  priceToBeat: number | null;
+  up: { price: number; liquidity: number } | null;
+  down: { price: number; liquidity: number } | null;
+  rsi: number | null;
+  atr: number | null;
+  rtv: number | null;
+  gapSafety: number | null;
+  divergence: number | null;
+  peakGapRatio: number | null;
+  binancePrice?: number;
+  coinbasePrice?: number;
+}): string {
+  const values: string[] = [];
+  const reasons: string[] = [];
+
+  if (params.btcPrice !== undefined) values.push(`asset=${params.btcPrice.toFixed(2)}`);
+  else reasons.push("asset_price_missing");
+
+  if (params.binancePrice !== undefined) values.push(`binance=${params.binancePrice.toFixed(2)}`);
+  else reasons.push("binance_missing");
+
+  if (params.coinbasePrice !== undefined) values.push(`coinbase=${params.coinbasePrice.toFixed(2)}`);
+  else reasons.push("coinbase_missing");
+
+  if (params.priceToBeat !== null) values.push(`open=${params.priceToBeat.toFixed(2)}`);
+  else reasons.push("market_open_price_missing");
+
+  if (params.up !== null) values.push(`up=${params.up.price.toFixed(2)}@${params.up.liquidity.toFixed(0)}`);
+  else reasons.push("up_book_missing");
+
+  if (params.down !== null) values.push(`down=${params.down.price.toFixed(2)}@${params.down.liquidity.toFixed(0)}`);
+  else reasons.push("down_book_missing");
+
+  if (params.rsi !== null) values.push(`rsi=${params.rsi.toFixed(2)}`);
+  else reasons.push("rsi_not_ready");
+
+  if (params.atr !== null) values.push(`atr=${params.atr.toFixed(2)}`);
+  else reasons.push("atr_not_ready");
+
+  if (params.rtv !== null) values.push(`rtv=${params.rtv.toFixed(2)}`);
+  else reasons.push("rtv_not_ready");
+
+  if (params.gapSafety !== null) values.push(`gapSafety=${params.gapSafety.toFixed(2)}`);
+  else reasons.push("gap_safety_unavailable");
+
+  if (params.divergence !== null) values.push(`divergence=${params.divergence.toFixed(2)}`);
+  else reasons.push("coinbase_divergence_unavailable");
+
+  if (params.peakGapRatio !== null) values.push(`peakGapRatio=${params.peakGapRatio.toFixed(2)}`);
+  else reasons.push("peak_gap_ratio_unavailable");
+
+  if (params.remaining >= 5 && params.priceToBeat !== null && params.btcPrice !== undefined) {
+    const gap = params.btcPrice - params.priceToBeat;
+    values.push(`gap=${gap.toFixed(2)}`);
+
+    if (params.remaining <= 90) {
+      if (params.atr === null) reasons.push("atr_not_ready");
+      else if (params.atr > 2) reasons.push(`atr_too_high=${params.atr.toFixed(2)}`);
+
+      if (params.gapSafety === null) reasons.push("gap_safety_unavailable");
+      else if (params.gapSafety < 40) reasons.push(`gap_safety_too_low=${params.gapSafety.toFixed(2)}`);
+
+      if (params.divergence === null) reasons.push("coinbase_divergence_unavailable");
+      else if (params.divergence > 10) reasons.push(`divergence_too_high=${params.divergence.toFixed(2)}`);
+
+      if (params.peakGapRatio === null) reasons.push("peak_gap_ratio_unavailable");
+      else if (params.peakGapRatio < 0.75) reasons.push(`peak_gap_ratio_too_low=${params.peakGapRatio.toFixed(2)}`);
+
+      const upCertain = params.up !== null && params.up.price > 0.85;
+      const downCertain = params.down !== null && params.down.price > 0.85;
+      if (!upCertain && !downCertain) {
+        reasons.push("no_certain_side");
+      } else {
+        const chosen = upCertain ? params.up! : params.down!;
+        if (chosen.liquidity < 20) {
+          reasons.push(`${upCertain ? "up" : "down"}_liquidity_too_low=${chosen.liquidity.toFixed(0)}`);
+        }
+      }
+    } else {
+      reasons.push(`waiting_for_entry_window(remaining=${params.remaining}s)`);
+    }
+  }
+
+  if (reasons.length === 0) reasons.push("signal_ok");
+  return [...values, ...reasons].join("; ");
+}
+
+function sharesForNotional(price: number, notionalUsd = TARGET_ORDER_USD): number {
+  return Math.max(1, Math.ceil(notionalUsd / price));
+}
 
 function checkEntry(params: {
   remaining: number;
@@ -289,10 +385,11 @@ function placeEntry(
   const tokenId =
     signal.side === "UP" ? ctx.clobTokenIds[0] : ctx.clobTokenIds[1];
 
+  const size = sharesForNotional(signal.ask);
+
   ctx.postOrders([
     {
-      force: process.env.FORCE_FIRST_TRADE === "true",
-      req: { tokenId, action: "buy", price: signal.ask, shares: SHARES },
+      req: { tokenId, action: "buy", price: signal.ask, shares: size },
       expireAtMs: ctx.slotEndMs,
       onFilled(filledShares) {
         state.position = {
@@ -429,48 +526,13 @@ export const lateEntry: Strategy = async (ctx) => {
     stopLossFired: false,
   };
   const indicators = new Indicators();
-
-  const forceFirstTrade = process.env.FORCE_FIRST_TRADE === "true";
-
-  const forceTradeOnce = (): boolean => {
-    if (!forceFirstTrade || state.hasEntered) return false;
-
-    const btcPrice = ctx.ticker.price;
-    const up = ctx.orderBook.bestAskInfo("UP");
-    const down = ctx.orderBook.bestAskInfo("DOWN");
-
-    if (btcPrice === undefined) return false;
-
-    const marketResult = ctx.getMarketResult();
-    const gap = marketResult?.openPrice != null ? btcPrice - marketResult.openPrice : null;
-    indicators.tick(gap, btcPrice);
-
-    const chosenSide: "UP" | "DOWN" | null =
-      up && down ? (up.price <= down.price ? "UP" : "DOWN") : up ? "UP" : down ? "DOWN" : null;
-    const info = chosenSide === "UP" ? up : chosenSide === "DOWN" ? down : null;
-    if (!info) return false;
-
-    const chosen = chosenSide ?? "UP";
-    state.hasEntered = true;
-    ctx.log(
-      `[${ctx.slug}] FORCE TEST TRADE: BUY ${chosen} @ ${info.price} (liq $${info.liquidity.toFixed(0)})`,
-      "cyan",
-    );
-    placeEntry(ctx, state, {
-      side: chosen,
-      ask: info.price,
-      gap: gap !== null ? Math.abs(gap) : 0,
-      liquidity: info.liquidity,
-      stopLossPrice: 0.48,
-    });
-    return true;
-  };
+  let lastNoSignalLogAt = 0;
 
   const tickInterval = setInterval(() => {
     const remaining = Math.floor((ctx.slotEndMs - Date.now()) / 1000);
-
     if (remaining <= 0) {
       clearInterval(tickInterval);
+      releaseLock();
       return;
     }
 
@@ -481,19 +543,42 @@ export const lateEntry: Strategy = async (ctx) => {
     }
 
     const btcPrice = ctx.ticker.price;
-    if (!state.hasEntered && btcPrice !== undefined && forceTradeOnce()) return;
-
+    const binancePrice = ctx.ticker.binancePrice;
+    const coinbasePrice = ctx.ticker.coinbasePrice;
     const priceToBeat = ctx.getMarketResult()?.openPrice ?? null;
-    if (!priceToBeat) return;
+    const up = ctx.orderBook.bestAskInfo("UP");
+    const down = ctx.orderBook.bestAskInfo("DOWN");
 
-    const gap = btcPrice !== undefined ? btcPrice - priceToBeat : null;
+    if (btcPrice === undefined || priceToBeat === null) {
+      const now = Date.now();
+      if (now - lastNoSignalLogAt >= NO_SIGNAL_LOG_INTERVAL_MS) {
+        lastNoSignalLogAt = now;
+        ctx.log(
+          `[${ctx.slug}] late-entry: waiting — ${explainNoSignal({
+            remaining,
+            btcPrice,
+            priceToBeat,
+            up,
+            down,
+            rsi: indicators.rsi,
+            atr: indicators.atr,
+            rtv: indicators.rtv,
+            gapSafety: null,
+            divergence: ctx.ticker.divergence,
+            peakGapRatio: null,
+            binancePrice,
+            coinbasePrice,
+          })}`,
+          "yellow",
+        );
+      }
+      return;
+    }
 
+    const gap = btcPrice - priceToBeat;
     indicators.tick(gap, btcPrice);
 
-    if (!state.hasEntered && btcPrice !== undefined) {
-      const up = ctx.orderBook.bestAskInfo("UP");
-      const down = ctx.orderBook.bestAskInfo("DOWN");
-
+    if (!state.hasEntered) {
       const signal = checkEntry({
         remaining,
         btcPrice,
@@ -503,9 +588,9 @@ export const lateEntry: Strategy = async (ctx) => {
         rsi: indicators.rsi,
         atr: indicators.atr,
         rtv: indicators.rtv,
-        gapSafety: gap !== null ? indicators.gapSafety(gap) : null,
+        gapSafety: indicators.gapSafety(gap),
         divergence: ctx.ticker.divergence,
-        peakGapRatio: gap !== null ? indicators.peakGapRatio(gap) : null,
+        peakGapRatio: indicators.peakGapRatio(gap),
       });
 
       if (signal) {
@@ -515,11 +600,38 @@ export const lateEntry: Strategy = async (ctx) => {
           "cyan",
         );
         placeEntry(ctx, state, signal);
+      } else {
+        const now = Date.now();
+        if (now - lastNoSignalLogAt >= NO_SIGNAL_LOG_INTERVAL_MS) {
+          lastNoSignalLogAt = now;
+          ctx.log(
+            `[${ctx.slug}] late-entry: no signal — ${explainNoSignal({
+              remaining,
+              btcPrice,
+              priceToBeat,
+              up,
+              down,
+              rsi: indicators.rsi,
+              atr: indicators.atr,
+              rtv: indicators.rtv,
+              gapSafety: indicators.gapSafety(gap),
+              divergence: ctx.ticker.divergence,
+              peakGapRatio: indicators.peakGapRatio(gap),
+              binancePrice,
+              coinbasePrice,
+            })}`,
+            "yellow",
+          );
+        }
       }
     }
 
     if (state.position && !state.stopLossFired) {
       checkStopLoss(ctx, state, remaining, gap, indicators.rsi);
     }
-  }, 0);
+  }, 1000);
+
+  return () => {
+    clearInterval(tickInterval);
+  };
 };

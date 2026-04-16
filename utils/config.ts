@@ -8,6 +8,7 @@ export type Config = {
   PROD: boolean;
   PRIVATE_KEY: string;
   POLY_FUNDER_ADDRESS: string;
+  DEBUG_ORDER_SIGNING: boolean;
 };
 
 const ASSET_TICKER_MAP: Record<
@@ -65,9 +66,11 @@ export class Env {
     PROD: false,
     PRIVATE_KEY: "",
     POLY_FUNDER_ADDRESS: "",
+    DEBUG_ORDER_SIGNING: false,
   };
 
   static get<T extends keyof Config>(key: T): Config[T] {
+
     const raw = process.env[key];
     const defaultVal = this.defaults[key];
 

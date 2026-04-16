@@ -21,6 +21,14 @@ type LogEntry =
     }
   | { type: "info"; msg: string; reason?: string }
   | {
+      type: "market_result_fallback";
+      slug: string;
+      usedSlotStart: number;
+      currentSlotStart: number;
+      openPrice: number;
+      fallbackDepth: number;
+    }
+  | {
       type: "resolution";
       direction: "UP" | "DOWN";
       openPrice: number;
@@ -59,7 +67,7 @@ export class Logger {
       })
     | null = null;
   private _marketResultProvider:
-    | (() => { openPrice?: number; gap?: number; priceToBeat?: number })
+    | (() => { openPrice?: number; gap?: number; priceToBeat?: number } | undefined)
     | null = null;
   private _snapshotTimer: NodeJS.Timeout | null = null;
   private _slotEndMs: number = 0;
@@ -71,7 +79,7 @@ export class Logger {
 
   /** Inject a market result provider — emits a market_price entry when openPrice is available. */
   setMarketResultProvider(
-    fn: () => { openPrice?: number; gap?: number; priceToBeat?: number },
+    fn: () => { openPrice?: number; gap?: number; priceToBeat?: number } | undefined,
   ) {
     this._marketResultProvider = fn;
   }
@@ -147,7 +155,7 @@ export class Logger {
     }
     if (this._marketResultProvider) {
       const data = this._marketResultProvider();
-      if (data.openPrice) {
+      if (data?.openPrice != null) {
         this._append({ type: "market_price", ...data });
       }
     }

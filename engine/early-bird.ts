@@ -37,6 +37,7 @@ export class EarlyBird {
   private readonly _minSessionPnl: number;
   private readonly _alwaysLog: boolean;
   private _roundsCreated = 0;
+  private _lastHeartbeatMs = 0;
   private _tracker!: WalletTracker;
   private _ticker = new TickerTracker();
 
@@ -195,6 +196,12 @@ export class EarlyBird {
         .tick()
         .catch((e) => log.write(`[${slug}] tick error: ${e}`, "red"));
       if (lifecycle.state === "DONE") done.push(slug);
+    }
+
+    if (Date.now() - this._lastHeartbeatMs >= 60_000) {
+      this._lastHeartbeatMs = Date.now();
+      const active = [...this._lifecycles.keys()].join(", ") || "none";
+      log.write(`[heartbeat] active=${active}`, "dim");
     }
 
     // Process completed lifecycles

@@ -303,7 +303,7 @@ export class PolymarketEarlyBirdClient implements EarlyBirdClient {
       137,
       this._signer,
       creds,
-      0, // Browser wallet / EOA signer
+      2, // Gnosis Safe / proxy signing mode that matches the working manual path
       this._funder,
     );
   }
@@ -312,7 +312,7 @@ export class PolymarketEarlyBirdClient implements EarlyBirdClient {
   async postMultipleOrders(
     orders: MultiOrderRequest[],
   ): Promise<PlacedOrder[]> {
-    const debugSigning = Env.get("DEBUG_ORDER_SIGNING") === "true";
+    const debugSigning = Env.get("DEBUG_ORDER_SIGNING");
     const signed = await Promise.all(
       orders.map((req) => {
         const userOrder: UserOrder = {
