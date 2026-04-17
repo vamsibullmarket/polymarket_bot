@@ -27,6 +27,7 @@ type LogEntry =
       currentSlotStart: number;
       openPrice: number;
       fallbackDepth: number;
+      reason?: string;
     }
   | {
       type: "resolution";

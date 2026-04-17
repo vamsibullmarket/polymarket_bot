@@ -56,36 +56,56 @@ export async function fetchWithRetry<T = Response>(
   const retryTimes = _params.totalRetry ?? 3;
   const currentRetry = _params._currentRetry ?? 0;
 
-  if (_params.abort?.aborted) return undefined as T;
+  if (_params.abort?.aborted) {
+    return undefined as T;
+  }
 
   try {
     const res = _params.useCurl
-      ? await curlFetch(url, _params.options?.headers as Record<string, string>, _params.abort)
+      ? await curlFetch(
+          url,
+          _params.options?.headers as Record<string, string>,
+          _params.abort,
+        )
       : await fetch(url, _params.options);
+
     if (!res.ok) {
       const obj = await res.text();
-      throw Error(obj);
+      throw new Error(obj);
     }
+
     if (params?.resolveWhen) {
       return await params.resolveWhen(res);
-    } else {
-      return res as T;
     }
+
+    return res as T;
   } catch (e) {
     // do not retry on abort
-    if (e instanceof DOMException && e.name === "AbortError")
+    if (e instanceof DOMException && e.name === "AbortError") {
       return undefined as T;
-
-    // retry
-    if (retryTimes - currentRetry <= 0) throw e;
-    let delay: number;
-    if (params?.retryBackOff) {
-      delay = params.retryBackOff(currentRetry);
-    } else {
-      delay = 1000 * Math.pow(2, currentRetry);
     }
-    if (_params.abort?.aborted) return undefined as T;
+
+    // CRITICAL: log every retry failure so we can see what's happening
+    console.log(
+      `[fetchWithRetry] retry=${currentRetry} useCurl=${Boolean(
+        _params.useCurl,
+      )} url=${url.toString()} err=${String(e)}`,
+    );
+
+    if (retryTimes - currentRetry <= 0) {
+      throw e;
+    }
+
+    const delay = params?.retryBackOff
+      ? params.retryBackOff(currentRetry)
+      : 1000 * Math.pow(2, currentRetry);
+
+    if (_params.abort?.aborted) {
+      return undefined as T;
+    }
+
     await sleep(delay);
+
     return await fetchWithRetry(url, {
       ..._params,
       _currentRetry: currentRetry + 1,

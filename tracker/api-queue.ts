@@ -44,53 +44,100 @@ export class APIQueue {
   }
 
   async queueEventDetails(slug: string) {
-    const res = await fetchWithRetry(
-      `https://gamma-api.polymarket.com/events?slug=${slug}`,
-    );
-    const event: EventResponse = ((await res.json()) as any[])[0];
+    const endpoint = `https://gamma-api.polymarket.com/events?slug=${slug}`;
+    console.log(`[api-queue] event request slug=${slug} url=${endpoint}`);
+  
+    const res = await fetchWithRetry(endpoint);
+    const raw = await res.text();
+  
+    // FULL RAW RESPONSE BODY
+    console.log(`[api-queue] event response slug=${slug} status=${res.status} body=${raw}`);
+  
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      console.log(`[api-queue] event parse_error slug=${slug} err=${String(e)}`);
+      throw e;
+    }
+  
+    const list = parsed as any[];
+    const event: EventResponse | undefined = list?.[0];
+  
+    if (!event) {
+      throw new Error(`No event found for slug=${slug}`);
+    }
+  
     this.eventResponse.set(slug, event);
   }
 
   queueMarketPrice(slot: Slot): { cancel: () => void } {
     if (this._queuedSlots.has(slot.startTime)) return { cancel: () => {} };
     this._queuedSlots.add(slot.startTime);
-
+  
     const { startTime, endTime } = slot;
     const controller = new AbortController();
-
+  
+    const slotStartSec = Math.floor(startTime / 1000);
+    const slotEndSec = Math.floor(endTime / 1000);
+  
     const url = new URL("https://polymarket.com/api/crypto/crypto-price");
     url.searchParams.set("symbol", Env.getAssetConfig().apiSymbol);
     url.searchParams.set("variant", "fiveminute");
     url.searchParams.set("eventStartTime", startTime.toString());
     url.searchParams.set("endDate", endTime.toString());
-
+  
+    console.log(
+      `[api-queue] request slotStartMs=${startTime} slotEndMs=${endTime} slotStartSec=${slotStartSec} slotEndSec=${slotEndSec} url=${url.toString()}`,
+    );
+  
     fetchWithRetry(url, {
       options: { headers: { Accept: "application/json" } },
-      // The API now requires TLSv1.3 with mlkem768x25519 which is only available
-      // in latest curl 8.19.0. Bun or Node is compiled with latest BoringSSL
-      // which causes ECONNRESET.
-      useCurl: true,
+      useCurl: false,
       totalRetry: Number.MAX_VALUE,
       abort: controller.signal,
       resolveWhen: async (res) => {
-        const data = (await res.json()) as MarketData;
+        const raw = await res.text();
+  
+        // FULL RAW RESPONSE BODY
+        console.log(
+          `[api-queue] response status=${res.status} slotStartMs=${startTime} body=${raw}`,
+        );
+  
+        let data: MarketData & {
+          timestamp?: number;
+          completed?: boolean;
+          incomplete?: boolean;
+          cached?: boolean;
+        };
+  
+        try {
+          data = JSON.parse(raw);
+        } catch (e) {
+          console.log(
+            `[api-queue] parse_error slotStartMs=${startTime} err=${String(e)}`,
+          );
+          throw e;
+        }
+  
         if (data.openPrice != null) {
           this.marketResult.set(slot.startTime, data);
+          console.log(
+            `[api-queue] open_ready slotStartMs=${startTime} open=${data.openPrice} close=${data.closePrice}`,
+          );
           return data;
         }
+  
         throw new Error("Open price not set yet");
       },
       retryBackOff: (currentRetry) => {
-        // market data is set delay by 5s
-        // once open price is set we do not do exponential retry delay
         if (this.marketResult.get(slot.startTime)) {
           return 8000;
-        } else {
-          return currentRetry * 500;
         }
+        return currentRetry * 500;
       },
     });
-
+  
     return { cancel: () => controller.abort() };
   }
 }

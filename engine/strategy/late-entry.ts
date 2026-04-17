@@ -217,6 +217,10 @@ type LateEntryState = {
 const TARGET_ORDER_USD = 2;
 const NO_SIGNAL_LOG_INTERVAL_MS = 5_000;
 
+// Open-price availability tuning
+const OPEN_PRICE_GRACE_AFTER_OPEN_S = 20;
+const OPEN_PRICE_HARD_TIMEOUT_S = 90;
+
 function explainNoSignal(params: {
   remaining: number;
   btcPrice?: number;
@@ -551,8 +555,42 @@ export const lateEntry: Strategy = async (ctx) => {
 
     if (btcPrice === undefined || priceToBeat === null) {
       const now = Date.now();
+      const secsToOpen = Math.ceil((ctx.slotStartMs - now) / 1000);
+      const secsSinceOpen = Math.max(0, Math.floor((now - ctx.slotStartMs) / 1000));
+    
       if (now - lastNoSignalLogAt >= NO_SIGNAL_LOG_INTERVAL_MS) {
         lastNoSignalLogAt = now;
+    
+        // Distinguish pre-open from post-open missing-openPrice.
+        if (secsToOpen > 0) {
+          ctx.log(
+            `[${ctx.slug}] late-entry: pre-open wait (opens in ${secsToOpen}s)`,
+            "yellow",
+          );
+          return;
+        }
+    
+        // Post-open grace window: API can legitimately lag.
+        if (priceToBeat === null && secsSinceOpen <= OPEN_PRICE_GRACE_AFTER_OPEN_S) {
+          ctx.log(
+            `[${ctx.slug}] late-entry: open price pending (${secsSinceOpen}s since open)`,
+            "yellow",
+          );
+          return;
+        }
+    
+        // Hard timeout: if open price still missing too long, skip this round safely.
+        if (priceToBeat === null && secsSinceOpen >= OPEN_PRICE_HARD_TIMEOUT_S) {
+          ctx.log(
+            `[${ctx.slug}] late-entry: open price unavailable after ${secsSinceOpen}s — skipping round`,
+            "red",
+          );
+          clearInterval(tickInterval);
+          releaseLock();
+          return;
+        }
+    
+        // Fallback diagnostic log for all other missing-data states.
         ctx.log(
           `[${ctx.slug}] late-entry: waiting — ${explainNoSignal({
             remaining,
@@ -568,7 +606,7 @@ export const lateEntry: Strategy = async (ctx) => {
             peakGapRatio: null,
             binancePrice,
             coinbasePrice,
-          })}`,
+          })}; secsSinceOpen=${secsSinceOpen}`,
           "yellow",
         );
       }

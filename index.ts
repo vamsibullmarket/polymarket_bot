@@ -15,14 +15,15 @@ const program = new Command()
   )
   .option(
     "--slot-offset <n>",
-    "Which future market slot to pre-enter or trade in current market (1 = next slot, 2 = slot after next, …)",
+    "Which market slot to trade (0 = current slot, 1 = next slot, 2 = slot after next, ...)",
     (v) => {
       const n = parseInt(v, 10);
-      if (isNaN(n) || n < 1)
-        throw new Error("--slot-offset must be a positive integer");
+      if (isNaN(n) || n < 0) {
+        throw new Error("--slot-offset must be a non-negative integer");
+      }
       return n;
     },
-    1,
+    0,
   )
   .option(
     "--prod",

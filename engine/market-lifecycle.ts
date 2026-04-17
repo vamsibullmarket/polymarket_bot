@@ -98,13 +98,54 @@ export class MarketLifecycle {
     const slot = slotFromSlug(this.slug);
     const intervalMs = slot.endTime - slot.startTime;
     const current = this.apiQueue.marketResult.get(slot.startTime);
-    if (current?.openPrice != null) return current;
-
+  
+    // Use current slot data whenever open is already known.
+    if (current?.openPrice != null) {
+      return current;
+    }
+  
+    // Try a short historical window for fallback.
     for (let stepsBack = 1; stepsBack <= 4; stepsBack++) {
       const prevSlotStart = slot.startTime - intervalMs * stepsBack;
       const prev = this.apiQueue.marketResult.get(prevSlotStart);
+  
+      // Preferred fallback:
+      // In contiguous 5m markets, previous close is the best proxy for current open.
+      if (prev?.closePrice != null) {
+        const fallback = {
+          startTime: slot.startTime,
+          endTime: slot.endTime,
+          completed: false,
+          openPrice: prev.closePrice,
+          closePrice: null,
+        };
+  
+        this.apiQueue.marketResult.set(slot.startTime, fallback);
+        this._marketLogger.log({
+          type: "market_result_fallback",
+          slug: this.slug,
+          usedSlotStart: prevSlotStart,
+          currentSlotStart: slot.startTime,
+          openPrice: prev.closePrice,
+          fallbackDepth: stepsBack,
+          reason: "used_prev_close",
+        });
+  
+        return fallback;
+      }
+  
+      // Secondary fallback if previous close is unavailable:
+      // use previous open just to unblock strategy calculations.
       if (prev?.openPrice != null) {
-        this.apiQueue.marketResult.set(slot.startTime, prev);
+        const fallback = {
+          startTime: slot.startTime,
+          endTime: slot.endTime,
+          completed: false,
+          openPrice: prev.openPrice,
+          closePrice: null,
+        };
+  
+        this.apiQueue.marketResult.set(slot.startTime, fallback);
         this._marketLogger.log({
           type: "market_result_fallback",
           slug: this.slug,
@@ -112,10 +153,13 @@ export class MarketLifecycle {
           currentSlotStart: slot.startTime,
           openPrice: prev.openPrice,
           fallbackDepth: stepsBack,
+          reason: "used_prev_open",
         });
-        return prev;
+  
+        return fallback;
       }
     }
+  
     return current ?? null;
   }
 
