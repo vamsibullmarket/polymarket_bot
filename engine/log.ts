@@ -64,3 +64,47 @@ class Log {
 }
 
 export const log = new Log();
+
+const MARKET_LOG_DIR = "logs/markets";
+const MAX_MARKET_LOGS = 10;
+
+export class MarketLog {
+  private readonly _path: string;
+  private _buf: string[] = [];
+  private _timer: ReturnType<typeof setInterval>;
+
+  constructor(slug: string) {
+    mkdirSync(MARKET_LOG_DIR, { recursive: true });
+    this._path = join(MARKET_LOG_DIR, `${slug}.log`);
+    this._pruneOld();
+    this._timer = setInterval(() => this._flush(), 1000);
+  }
+
+  private _pruneOld(): void {
+    try {
+      const files = readdirSync(MARKET_LOG_DIR)
+        .filter((f) => f.endsWith(".log"))
+        .map((f) => ({ name: f, mtime: statSync(join(MARKET_LOG_DIR, f)).mtimeMs }))
+        .sort((a, b) => a.mtime - b.mtime); // oldest first
+      for (const f of files.slice(0, Math.max(0, files.length - MAX_MARKET_LOGS + 1))) {
+        unlinkSync(join(MARKET_LOG_DIR, f.name));
+      }
+    } catch {}
+  }
+
+  write(msg: string): void {
+    this._buf.push(`[${new Date().toISOString()}] ${msg}\n`);
+  }
+
+  private _flush(): void {
+    if (this._buf.length === 0) return;
+    appendFileSync(this._path, this._buf.join(""), "utf8");
+    this._buf = [];
+  }
+
+  done(): void {
+    clearInterval(this._timer);
+    this._flush();
+    appendFileSync(this._path, `[${new Date().toISOString()}] [MARKET_COMPLETE]\n`, "utf8");
+  }
+}

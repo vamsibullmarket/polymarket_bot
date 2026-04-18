@@ -4,7 +4,7 @@ import { EarlyBirdSimClient, PolymarketEarlyBirdClient } from "./client.ts";
 import { MarketLifecycle } from "./market-lifecycle.ts";
 import { loadState, saveState, type CompletedMarketState } from "./state.ts";
 import { getSlug } from "../utils/slot.ts";
-import { log } from "./log.ts";
+import { log, MarketLog } from "./log.ts";
 import { recover } from "./recovery.ts";
 import {
   strategies,
@@ -17,6 +17,7 @@ import { Env } from "../utils/config.ts";
 import { writeFileSync, mkdirSync, readFileSync, existsSync } from "fs";
 import { dirname } from "path";
 
+
 const SAVE_INTERVAL_MS = 5000;
 const WINNING_SLUGS_PATH = "state/winning-btc-5m.txt";
 
@@ -24,6 +25,7 @@ const WINNING_SLUGS_PATH = "state/winning-btc-5m.txt";
 export class EarlyBird {
   private _lifecycles = new Map<string, MarketLifecycle>();
   private _completedSlugs = new Set<string>();
+  private _marketLogs = new Map<string, MarketLog>();
   private _completedMarkets: CompletedMarketState[] = [];
   private _client: EarlyBirdClient;
   private _apiQueue = new APIQueue();
@@ -82,22 +84,22 @@ export class EarlyBird {
 
   private _writeWinningSlugsDump(): void {
     mkdirSync(dirname(WINNING_SLUGS_PATH), { recursive: true });
-  
+
     // Keep what is already on disk so startup/state-recovery doesn't wipe winners.
     const existing = existsSync(WINNING_SLUGS_PATH)
       ? readFileSync(WINNING_SLUGS_PATH, "utf8")
-          .split("\n")
-          .map((s) => s.trim())
-          .filter(Boolean)
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean)
       : [];
-  
+
     const existingSet = new Set(existing);
-  
+
     // New winners from this process/runtime.
     const currentWinners = this._completedMarkets
       .filter((m) => m.pnl > 0 && m.slug.startsWith("btc-updown-5m-"))
       .map((m) => m.slug);
-  
+
     // Preserve file order; append only truly new winners.
     const merged = [...existing];
     for (const slug of currentWinners) {
@@ -106,12 +108,12 @@ export class EarlyBird {
         merged.push(slug);
       }
     }
-  
+
     // If nothing changed, don't rewrite.
     if (merged.length === existing.length) {
       return;
     }
-  
+
     const body = merged.length > 0 ? `${merged.join("\n")}\n` : "";
     writeFileSync(WINNING_SLUGS_PATH, body, "utf8");
   }
@@ -121,9 +123,9 @@ export class EarlyBird {
     this._ticker.schedule();
     await this._ticker.waitForReady();
     log.write(`[startup] ${Env.getAssetConfig().apiSymbol} ticker ready`);
-  
+
     await this._client.init();
-  
+
     // Seed wallet tracker
     let initialBalance: number;
     if (this._prod) {
@@ -137,27 +139,27 @@ export class EarlyBird {
     this._tracker = new WalletTracker(initialBalance, (msg) =>
       log.write(msg, "dim"),
     );
-  
+
     log.write(
       `[startup] Min session PnL exit: $${this._minSessionPnl.toFixed(2)}`,
     );
-  
+
     const state = loadState(this._statePath);
     if (state) {
       log.write(`[startup] Loading state from ${this._statePath}`);
       this._sessionPnl = state.sessionPnl;
       this._sessionLoss = state.sessionLoss ?? 0;
-  
+
       if (Math.abs(this._sessionLoss) >= this._minSessionPnl) {
         log.write(
           `[startup] Session loss from previous session ($${this._sessionLoss.toFixed(2)}) already meets or exceeds the MAX_SESSION_LOSS threshold (-$${this._minSessionPnl.toFixed(2)}). ` +
-            `The engine would shut down immediately. ` +
-            `To start fresh, reset "sessionLoss" to 0 in ${this._statePath}, or increase MAX_SESSION_LOSS in your .env.`,
+          `The engine would shut down immediately. ` +
+          `To start fresh, reset "sessionLoss" to 0 in ${this._statePath}, or increase MAX_SESSION_LOSS in your .env.`,
           "red",
         );
         process.exit(1);
       }
-  
+
       // Sim recovery: replay order history to reconstruct balance
       if (!this._prod) {
         for (const market of state.activeMarkets) {
@@ -170,7 +172,7 @@ export class EarlyBird {
           }
         }
       }
-  
+
       const recovered = await recover(
         state,
         this._client,
@@ -185,19 +187,19 @@ export class EarlyBird {
     } else {
       log.write("[startup] No saved state found. Starting fresh.");
     }
-  
+
     if (this._prod) {
       const { startClaimWinningCron } = await import("../scripts/claim-winning-cron.ts");
       startClaimWinningCron({ acquireLock: false }).catch((e) => {
         log.write(`[claim-cron] failed to start: ${String(e)}`, "red");
       });
     }
-  
+
     process.on("exit", () => {
       log.flush();
       this._saveState();
     });
-  
+
     const onSignal = (sig: string) => {
       log.write(
         `[shutdown] ${sig} received. Initiating graceful shutdown...`,
@@ -209,7 +211,7 @@ export class EarlyBird {
     };
     process.on("SIGINT", () => onSignal("SIGINT"));
     process.on("SIGTERM", () => onSignal("SIGTERM"));
-  
+
     setInterval(() => this._tick(), 100);
   }
 
@@ -220,13 +222,18 @@ export class EarlyBird {
     if (!this._shuttingDown && !roundsExhausted) {
       const slug = getSlug(this._slotOffset);
       if (!this._lifecycles.has(slug) && !this._completedSlugs.has(slug)) {
+        const marketLog = new MarketLog(slug);
+        this._marketLogs.set(slug, marketLog);
         this._lifecycles.set(
           slug,
           new MarketLifecycle({
             slug,
             apiQueue: this._apiQueue,
             client: this._client,
-            log: (msg, color) => log.write(msg, color),
+            log: (msg, color) => {
+              log.write(msg, color);
+              marketLog.write(msg);       // ← also write to per-market file
+            },
             strategyName: this._strategyName,
             strategy: this._strategy,
             tracker: this._tracker,
@@ -237,7 +244,7 @@ export class EarlyBird {
         this._roundsCreated++;
       }
     }
-  
+
     // Tick all lifecycles (fire-and-forget; _ticking guard prevents re-entry)
     const done: string[] = [];
     for (const [slug, lifecycle] of this._lifecycles) {
@@ -246,41 +253,41 @@ export class EarlyBird {
         .catch((e) => log.write(`[${slug}] tick error: ${e}`, "red"));
       if (lifecycle.state === "DONE") done.push(slug);
     }
-  
+
     if (Date.now() - this._lastHeartbeatMs >= 60_000) {
       this._lastHeartbeatMs = Date.now();
-  
+
       const running = [...this._lifecycles.entries()]
         .filter(([, l]) => l.state === "RUNNING")
         .map(([slug]) => slug);
-  
+
       const stopping = [...this._lifecycles.entries()]
         .filter(([, l]) => l.state === "STOPPING")
         .map(([slug]) => slug);
-  
+
       log.write(
         `[heartbeat] running=${running.join(", ") || "none"} | stopping=${stopping.join(", ") || "none"}`,
         "dim",
       );
-  
+
       const lifecycleEntries = [...this._lifecycles.entries()];
-  
+
       void (async () => {
         if (this._prod) {
           await this._client.updateUSDCBalance();
           const chainBalance = await this._client.getUSDCBalance();
           const trackedBalance = this._tracker.balance;
-  
+
           if (Number.isFinite(chainBalance)) {
             const delta = parseFloat((chainBalance - trackedBalance).toFixed(6));
-  
+
             if (Math.abs(delta) > 0.000001) {
               if (delta > 0) {
                 this._tracker.credit(delta);
               } else {
                 this._tracker.debit(-delta);
               }
-  
+
               log.write(
                 `[heartbeat] USDC reconciled tracked=$${trackedBalance.toFixed(2)} chain=$${chainBalance.toFixed(2)} delta=${delta >= 0 ? "+" : ""}$${delta.toFixed(2)}`,
                 "yellow",
@@ -288,7 +295,7 @@ export class EarlyBird {
             }
           }
         }
-  
+
         await Promise.allSettled(
           lifecycleEntries.map(([slug, lifecycle]) =>
             lifecycle
@@ -303,7 +310,7 @@ export class EarlyBird {
         log.write(`[heartbeat] error: ${String(e)}`, "red");
       });
     }
-  
+
     // Process completed lifecycles
     for (const slug of done) {
       const lifecycle = this._lifecycles.get(slug)!;
@@ -325,27 +332,32 @@ export class EarlyBird {
         pnl: lifecycle.pnl,
         orderHistory: lifecycle.orderHistory,
       });
+      const ml = this._marketLogs.get(slug);
+      if (ml) {
+        ml.done();
+        this._marketLogs.delete(slug);
+      }
       lifecycle.destroy();
       this._lifecycles.delete(slug);
       this._completedSlugs.add(slug);
-  
+
       if (Math.abs(this._sessionLoss) >= this._minSessionPnl) {
         this._startShutdown(
           `Session loss limit reached (total losses: $${this._sessionLoss.toFixed(2)}, threshold: -$${this._minSessionPnl.toFixed(2)}).`,
         );
       }
     }
-  
+
     // Throttled state persistence (every 5s)
     if (Date.now() - this._lastSaveMs >= SAVE_INTERVAL_MS) {
       this._saveState();
     }
-  
+
     // Auto-shutdown when all rounds complete and no lifecycles remain
     if (!this._shuttingDown && roundsExhausted && this._lifecycles.size === 0) {
       this._startShutdown(`All ${this._rounds} round(s) complete.`);
     }
-  
+
     // Exit once all lifecycles are settled during shutdown
     if (this._shuttingDown && this._lifecycles.size === 0) {
       log.write("[shutdown] All settled. Exiting.", "dim");
@@ -378,7 +390,7 @@ export class EarlyBird {
 
   private _saveState(): void {
     this._lastSaveMs = Date.now();
-  
+
     const activeMarkets = [...this._lifecycles.entries()]
       .filter(([, l]) => l.state === "RUNNING" || l.state === "STOPPING")
       .map(([slug, l]) => ({
@@ -389,14 +401,14 @@ export class EarlyBird {
         pendingOrders: l.pendingOrders,
         orderHistory: l.orderHistory,
       }));
-  
+
     saveState(this._statePath, {
       sessionPnl: this._sessionPnl,
       sessionLoss: this._sessionLoss,
       activeMarkets,
       completedMarkets: this._completedMarkets,
     });
-  
+
     // Keep a plain-text winners list for quick claim workflows.
     this._writeWinningSlugsDump();
   }
