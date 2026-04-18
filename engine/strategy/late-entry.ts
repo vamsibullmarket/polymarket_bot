@@ -467,7 +467,7 @@ function checkEntryV2(params: {
 
   // --- Price band: 0.74–0.77 only ---
   // Strong conviction zone: meaningful upside to 1.00, -0.20 stop stays above 0.50
-  if (info.price < 0.55 || info.price > 0.90) return null;
+  if (info.price < 0.74 || info.price > 0.90) return null;
 
   if (atr !== null && atr < 0.05) return null;
 
