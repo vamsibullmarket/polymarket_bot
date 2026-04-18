@@ -94,6 +94,75 @@ export class MarketLifecycle {
   private readonly _ticker: TickerTracker;
   private readonly _alwaysLog: boolean;
 
+  private async _confirmChainShares(
+    tokenId: string,
+    expectedShares: number,
+  ): Promise<number> {
+    // Short confirmation loop; conditional-token balances can lag briefly.
+    let chainShares = 0;
+    for (let i = 0; i < 4; i++) {
+      await this.client.updateAvailableShares(tokenId);
+      chainShares = await this.client.getAvailableShares(tokenId);
+      if (chainShares >= expectedShares) {
+        return chainShares;
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    return chainShares;
+  }
+  
+  private async _reconcileTokenWithChain(tokenId: string): Promise<string | null> {
+    const tracked = this._tracker.getTrackedShares(tokenId);
+    await this.client.updateAvailableShares(tokenId);
+    const chain = await this.client.getAvailableShares(tokenId);
+  
+    // Keep a tiny epsilon for float representation
+    if (Math.abs(chain - tracked) <= 0.000001) {
+      return null;
+    }
+  
+    this._tracker.setTrackedShares(tokenId, chain);
+    const side =
+      this._clobTokenIds && tokenId === this._clobTokenIds[0] ? "UP" : "DOWN";
+  
+    return `${side}:tracked=${tracked.toFixed(6)} chain=${chain.toFixed(6)}`;
+  }
+  
+  /**
+   * Called by engine heartbeat:
+   * - reconcile local tracked token shares with exchange truth
+   * - if lifecycle is already stoppable, finalize settlement
+   */
+  async heartbeatCheckAndMaybeSettle(): Promise<string> {
+    if (!this._clobTokenIds) {
+      return `[${this.slug}] hb: clobTokenIds not ready`;
+    }
+  
+    const mismatches: string[] = [];
+  
+    const m1 = await this._reconcileTokenWithChain(this._clobTokenIds[0]);
+    if (m1) mismatches.push(m1);
+  
+    const m2 = await this._reconcileTokenWithChain(this._clobTokenIds[1]);
+    if (m2) mismatches.push(m2);
+  
+    // If already in STOPPING and no pending/in-flight, attempt finalization now.
+    if (
+      this._state === "STOPPING" &&
+      this._pendingOrders.length === 0 &&
+      this._inFlight === 0
+    ) {
+      if (this._hasUnfilledPositions()) {
+        await this._waitForResolution();
+      }
+      this._computePnl();
+      this._state = "DONE";
+      return `[${this.slug}] hb: reconciled(${mismatches.join(" | ") || "ok"}), forced DONE`;
+    }
+  
+    return `[${this.slug}] hb: reconciled(${mismatches.join(" | ") || "ok"})`;
+  }
+
   private _getMarketResultWithFallback() {
     const slot = slotFromSlug(this.slug);
     const intervalMs = slot.endTime - slot.startTime;
@@ -294,15 +363,15 @@ export class MarketLifecycle {
     await this.apiQueue.queueEventDetails(this.slug);
     const event = this.apiQueue.eventDetails.get(this.slug);
     if (!event) return;
-
+  
     const market = event.markets[0];
     if (!market) return;
-
+  
     const tokenIds: string[] = JSON.parse(market.clobTokenIds);
     this._clobTokenIds = [tokenIds[0]!, tokenIds[1]!];
-
+  
     this._feeRate = market.feeSchedule?.rate ?? 0;
-
+  
     const slot = slotFromSlug(this.slug);
     const delayMs = Math.max(0, slot.startTime - Date.now());
     const prevSlot = { startTime: slot.startTime - (slot.endTime - slot.startTime), endTime: slot.startTime };
@@ -310,7 +379,7 @@ export class MarketLifecycle {
       this._marketPriceHandle = this.apiQueue.queueMarketPrice(slot);
       this.apiQueue.queueMarketPrice(prevSlot);
     }, delayMs);
-
+  
     this._orderBook.subscribe(this._clobTokenIds);
     this._marketLogger.setSnapshotProvider(() =>
       this._orderBook.getSnapshotData(),
@@ -336,7 +405,7 @@ export class MarketLifecycle {
       this.slotEndMs,
       this._strategyName,
     );
-
+  
     const ctx: StrategyContext = {
       slug: this.slug,
       slotStartMs: this.slotStartMs,
@@ -345,6 +414,7 @@ export class MarketLifecycle {
       orderBook: this._orderBook,
       log: this._log,
       getOrderById: this.client.getOrderById.bind(this.client),
+      getTrackedShares: this._tracker.getTrackedShares.bind(this._tracker),
       postOrders: this._postOrders.bind(this),
       cancelOrders: this._cancelOrders.bind(this),
       emergencySells: this._emergencySells.bind(this),
@@ -371,9 +441,9 @@ export class MarketLifecycle {
         return this._getMarketResultWithFallback() ?? undefined;
       },
     };
-
+  
     await this._orderBook.waitForReady();
-
+  
     const cleanup = await this._strategy(ctx);
     if (cleanup) this._strategyCleanup = cleanup;
     this._state = "RUNNING";
@@ -504,22 +574,36 @@ export class MarketLifecycle {
       }
 
       if (order.status === "filled") {
-        const grossShares = order.actualShares > 0 ? order.actualShares : order.shares;
+        const grossShares =
+          order.actualShares > 0 ? order.actualShares : order.shares;
+      
         let fee = 0;
         if (pending.orderType === "FOK" && this._feeRate > 0) {
           // Taker fee: fee = C × feeRate × p × (1 - p)
-          fee =
-            grossShares * this._feeRate * pending.price * (1 - pending.price);
+          fee = grossShares * this._feeRate * pending.price * (1 - pending.price);
         }
-
+      
         let shares = grossShares;
         if (pending.action === "buy" && fee > 0) {
-          // Buy fee is deducted in shares, avoids double-counting since fee we price * grossed shares in pnl
+          // Buy fee is deducted in shares
           shares = grossShares - fee / pending.price;
         }
-
+      
         if (pending.action === "buy") {
+          // First apply optimistic tracker update, then verify chain balance.
           this._tracker.onBuyFilled(pending.orderId, pending.tokenId, shares);
+      
+          const chainShares = await this._confirmChainShares(pending.tokenId, shares);
+          if (chainShares + 0.000001 < shares) {
+            this._log(
+              `[${this.slug}] BUY fill reconciliation: expected=${shares.toFixed(6)} chain=${chainShares.toFixed(6)} token=${pending.tokenId.slice(0, 8)}...`,
+              "yellow",
+            );
+      
+            // Clamp local shares to chain truth so stop-loss sells don't fail with balance=0.
+            this._tracker.setTrackedShares(pending.tokenId, chainShares);
+            shares = chainShares;
+          }
         } else {
           this._tracker.onSellFilled(
             pending.orderId,
@@ -528,6 +612,7 @@ export class MarketLifecycle {
             shares,
           );
         }
+      
         this._orderHistory.push({
           action: pending.action,
           price: pending.price,
@@ -535,10 +620,10 @@ export class MarketLifecycle {
           fee,
           tokenId: pending.tokenId,
         });
+      
         this._removePendingOrder(pending.orderId);
-        this._marketLogger.log(
-          this._createOrderEntry(pending, "filled", { shares }),
-        );
+        this._marketLogger.log(this._createOrderEntry(pending, "filled", { shares }));
+      
         if (pending.onFilled) {
           pending.onFilled(shares);
         }

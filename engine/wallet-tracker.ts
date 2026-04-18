@@ -131,4 +131,17 @@ export class WalletTracker {
     this._shares.set(tokenId, current + count);
   }
 
+  getTrackedShares(tokenId: string): number {
+    return this._shares.get(tokenId) ?? 0;
+  }
+  
+  setTrackedShares(tokenId: string, shares: number): void {
+    const normalized = Math.max(0, shares);
+    const prev = this._shares.get(tokenId) ?? 0;
+    this._shares.set(tokenId, normalized);
+    this._log(
+      `[wallet] reconcileShares ${tokenId.slice(0, 8)}...: ${prev} -> ${normalized}`,
+    );
+  }
+
 }

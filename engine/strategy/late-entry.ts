@@ -200,30 +200,44 @@ type LateEntryPosition = {
   side: "UP" | "DOWN";
   tokenId: string;
   entryPrice: number;
+  entryBid: number;
   shares: number;
   stopLossPrice: number;
+  maxSeenBid: number;
+  prevBid: number | null;      // bid from previous tick, for velocity calculation
+  breakEvenLocked: boolean;
+  gapRevTicks: number;
+  stopBreachTicks: number;
 };
 
 type LateEntryState = {
   hasEntered: boolean;
   position: LateEntryPosition | null;
   stopLossFired: boolean;
+  exitInProgress: boolean;
+  hadPosition: boolean;
+  released: boolean;
+  signalConfirmTicks: number;  // consecutive ticks with same signal — must hit 2 before entering
 };
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const TARGET_ORDER_USD = 2;
+const TARGET_ORDER_USD = 5;
 const NO_SIGNAL_LOG_INTERVAL_MS = 5_000;
 
 // Open-price availability tuning
 const OPEN_PRICE_GRACE_AFTER_OPEN_S = 20;
 const OPEN_PRICE_HARD_TIMEOUT_S = 90;
 
+const ENTRY_STRATEGY: "v1" | "v2" = "v2";
+
+
 function explainNoSignal(params: {
   remaining: number;
   btcPrice?: number;
+  oraclePrice?: number;
   priceToBeat: number | null;
   up: { price: number; liquidity: number } | null;
   down: { price: number; liquidity: number } | null;
@@ -239,8 +253,10 @@ function explainNoSignal(params: {
   const values: string[] = [];
   const reasons: string[] = [];
 
-  if (params.btcPrice !== undefined) values.push(`asset=${params.btcPrice.toFixed(2)}`);
-  else reasons.push("asset_price_missing");
+  if (params.btcPrice !== undefined) values.push(`live=${params.btcPrice.toFixed(2)}`);
+  else reasons.push("live_price_missing");
+
+  if (params.oraclePrice !== undefined) values.push(`oracle=${params.oraclePrice.toFixed(2)}`);
 
   if (params.binancePrice !== undefined) values.push(`binance=${params.binancePrice.toFixed(2)}`);
   else reasons.push("binance_missing");
@@ -279,31 +295,67 @@ function explainNoSignal(params: {
     const gap = params.btcPrice - params.priceToBeat;
     values.push(`gap=${gap.toFixed(2)}`);
 
-    if (params.remaining <= 90) {
+    if (params.remaining > 150) {
+      reasons.push(`entry_in=${params.remaining - 150}s`);
+    } else if (params.remaining < 35) {
+      reasons.push(`too_late(remaining=${params.remaining}s)`);
+    } else if (ENTRY_STRATEGY === "v1") {
+      // V1 conditions
       if (params.atr === null) reasons.push("atr_not_ready");
-      else if (params.atr > 2) reasons.push(`atr_too_high=${params.atr.toFixed(2)}`);
+      else if (params.atr > 22) reasons.push(`atr_too_high=${params.atr.toFixed(2)}`);
 
-      if (params.gapSafety === null) reasons.push("gap_safety_unavailable");
-      else if (params.gapSafety < 40) reasons.push(`gap_safety_too_low=${params.gapSafety.toFixed(2)}`);
+      if (params.divergence !== null && params.divergence > 18) reasons.push(`divergence_too_high=${params.divergence.toFixed(2)}`);
 
-      if (params.divergence === null) reasons.push("coinbase_divergence_unavailable");
-      else if (params.divergence > 10) reasons.push(`divergence_too_high=${params.divergence.toFixed(2)}`);
+      const upStrong = params.up !== null && params.up.price >= 0.62 && params.up.liquidity >= 60;
+      const downStrong = params.down !== null && params.down.price >= 0.62 && params.down.liquidity >= 60;
+      if (!upStrong && !downStrong) reasons.push("no_strong_side");
 
-      if (params.peakGapRatio === null) reasons.push("peak_gap_ratio_unavailable");
-      else if (params.peakGapRatio < 0.75) reasons.push(`peak_gap_ratio_too_low=${params.peakGapRatio.toFixed(2)}`);
+      if (upStrong && gap < -20) reasons.push(`gap_contradicts_up(gap=${gap.toFixed(0)})`);
+      if (downStrong && !upStrong && gap > 20) reasons.push(`gap_contradicts_down(gap=${gap.toFixed(0)})`);
+    } else {
+      // V2 conditions
+      // V2 conditions
+      if (params.atr === null) reasons.push("atr_not_ready");
+      else if (params.atr > 22) reasons.push(`atr_too_high=${params.atr.toFixed(2)}`);
 
-      const upCertain = params.up !== null && params.up.price > 0.85;
-      const downCertain = params.down !== null && params.down.price > 0.85;
-      if (!upCertain && !downCertain) {
-        reasons.push("no_certain_side");
+      if (params.divergence !== null && params.divergence > 18) reasons.push(`divergence_too_high=${params.divergence.toFixed(2)}`);
+
+      if (params.rsi === null) {
+        reasons.push("rsi_not_ready");
       } else {
-        const chosen = upCertain ? params.up! : params.down!;
-        if (chosen.liquidity < 20) {
-          reasons.push(`${upCertain ? "up" : "down"}_liquidity_too_low=${chosen.liquidity.toFixed(0)}`);
+        const upStrong = params.up !== null && params.up.price >= 0.55 && params.up.liquidity >= 60;
+        const downStrong = params.down !== null && params.down.price >= 0.55 && params.down.liquidity >= 60;
+
+        if (!upStrong && !downStrong) {
+          reasons.push("no_strong_side");
+        } else {
+          let side: "UP" | "DOWN";
+          let info: { price: number; liquidity: number };
+          if (upStrong && downStrong) {
+            if (gap > 8) { side = "UP"; info = params.up!; }
+            else if (gap < -8) { side = "DOWN"; info = params.down!; }
+            else {
+              const upScore = params.up!.price * params.up!.liquidity;
+              const downScore = params.down!.price * params.down!.liquidity;
+              side = upScore >= downScore ? "UP" : "DOWN";
+              info = side === "UP" ? params.up! : params.down!;
+            }
+          } else if (upStrong) { side = "UP"; info = params.up!; }
+          else { side = "DOWN"; info = params.down!; }
+
+          if (Math.abs(gap) < 25) reasons.push(`gap_too_small(${gap.toFixed(1)})`);
+          if (info.liquidity < 120) reasons.push(`liq_too_low=${info.liquidity.toFixed(0)}`);
+          if (side === "UP" && params.rsi < 55) reasons.push(`rsi_contradicts_up(rsi=${params.rsi.toFixed(1)})`);
+          if (side === "DOWN" && params.rsi > 45) reasons.push(`rsi_contradicts_down(rsi=${params.rsi.toFixed(1)})`);
+          if (side === "UP" && gap < -8) reasons.push(`gap_contradicts_up(gap=${gap.toFixed(0)})`);
+          if (side === "DOWN" && gap > 8) reasons.push(`gap_contradicts_down(gap=${gap.toFixed(0)})`);
+          if (info.price < 0.55) reasons.push(`price_too_low=${info.price.toFixed(2)}`);
+          if (info.price > 0.90) reasons.push(`price_too_high=${info.price.toFixed(2)}`);
+          if (info.liquidity < 80) reasons.push(`liq_too_low=${info.liquidity.toFixed(0)}`);
+          if (params.peakGapRatio !== null && params.peakGapRatio < 0.55) reasons.push(`peak_gap_ratio_low=${params.peakGapRatio.toFixed(2)}`);
+          if (params.gapSafety !== null && params.gapSafety < 8) reasons.push(`gap_safety_low=${params.gapSafety.toFixed(2)}`);
         }
       }
-    } else {
-      reasons.push(`waiting_for_entry_window(remaining=${params.remaining}s)`);
     }
   }
 
@@ -313,6 +365,122 @@ function explainNoSignal(params: {
 
 function sharesForNotional(price: number, notionalUsd = TARGET_ORDER_USD): number {
   return Math.max(1, Math.ceil(notionalUsd / price));
+}
+
+/**
+ * Strategy V2 entry: same base gates as V1 but adds:
+ *  - RSI on gap must confirm direction (gap momentum alignment)
+ *  - Tighter gap/direction sanity (-8/+8 vs -20/+20)
+ *  - When both sides are strong, gap direction wins the tiebreaker first;
+ *    price*liquidity score is only a secondary tiebreaker when gap is near zero
+ *  - Entry price ceiling: avoid paying > 0.82 (market already priced in the move)
+ *  - Entry price floor: avoid paying < 0.58 (too uncertain, wide stop needed)
+ */
+/**
+ * Strategy V2 entry: same base gates as V1 but adds:
+ *  - RSI on gap must confirm direction (gap momentum alignment)
+ *  - Tighter gap/direction sanity (-8/+8 vs -20/+20)
+ *  - When both sides are strong, gap direction wins the tiebreaker first;
+ *    price*liquidity score is only a secondary tiebreaker when gap is near zero
+ *  - Entry price band: 0.74–0.77 (strong conviction zone with meaningful upside)
+ *  - Stop at entry - 0.20; only promotes to 0.92 once bid hits 0.95
+ */
+function checkEntryV2(params: {
+  remaining: number;
+  btcPrice: number;
+  priceToBeat: number;
+  up: { price: number; liquidity: number } | null;
+  down: { price: number; liquidity: number } | null;
+  rsi: number | null;
+  atr: number | null;
+  rtv: number | null;
+  gapSafety: number | null;
+  divergence: number | null;
+  peakGapRatio: number | null;
+}): EntrySignal | null {
+  const { remaining, btcPrice, priceToBeat, up, down, atr, divergence, rsi } = params;
+
+  // --- Time window: 150 seconds remaining ---
+  if (remaining < 35 || remaining > 150) return null;
+
+  // --- Volatility gate ---
+  if (atr === null || atr > 22) return null;
+
+  // --- Exchange divergence gate ---
+  const div = divergence ?? Infinity;
+  if (div > 18) return null;
+
+  // --- RSI must be ready ---
+  if (rsi === null) return null;
+
+  const gap = btcPrice - priceToBeat;
+
+  // --- CLOB conviction ---
+  const upStrong = up !== null && up.price >= 0.55 && up.liquidity >= 60;
+  const downStrong = down !== null && down.price >= 0.55 && down.liquidity >= 60;
+  if (!upStrong && !downStrong) return null;
+
+  // --- Minimum absolute gap ---
+  if (Math.abs(gap) < 25) return null;
+
+  // --- Gap safety: |gap| / ATR must be meaningful ---
+  if (params.gapSafety !== null && params.gapSafety < 8) return null;
+
+  // --- Peak gap ratio: gap must still be near its peak ---
+  if (params.peakGapRatio !== null && params.peakGapRatio < 0.55) return null;
+
+  // --- Determine side with gap direction as primary tiebreaker ---
+  let side: "UP" | "DOWN";
+  let info: { price: number; liquidity: number };
+
+  if (upStrong && downStrong) {
+    if (gap > 8) {
+      side = "UP";
+      info = up!;
+    } else if (gap < -8) {
+      side = "DOWN";
+      info = down!;
+    } else {
+      const upScore = up!.price * up!.liquidity;
+      const downScore = down!.price * down!.liquidity;
+      side = upScore >= downScore ? "UP" : "DOWN";
+      info = side === "UP" ? up! : down!;
+    }
+  } else if (upStrong) {
+    side = "UP";
+    info = up!;
+  } else {
+    side = "DOWN";
+    info = down!;
+  }
+
+  // --- Directional side needs stronger liquidity than the baseline $80 floor ---
+  if (info.liquidity < 80) return null;
+
+  // --- RSI momentum must agree with chosen side ---
+  if (side === "UP" && rsi < 35) return null;
+  if (side === "DOWN" && rsi > 65) return null;
+
+  // --- Gap/direction sanity ---
+  if (side === "UP" && gap < -8) return null;
+  if (side === "DOWN" && gap > 8) return null;
+
+  // --- Price band: 0.74–0.77 only ---
+  // Strong conviction zone: meaningful upside to 1.00, -0.20 stop stays above 0.50
+  if (info.price < 0.55 || info.price > 0.90) return null;
+
+  if (atr !== null && atr < 0.05) return null;
+
+  // Stop is fixed at entry - 0.20; floor at 0.50 as hard minimum
+  const stopLossPrice = Math.max(0.50, info.price - 0.20);
+
+  return {
+    side,
+    ask: info.price,
+    gap: Math.abs(gap),
+    liquidity: info.liquidity,
+    stopLossPrice,
+  };
 }
 
 function checkEntry(params: {
@@ -335,46 +503,66 @@ function checkEntry(params: {
     up,
     down,
     atr,
-    gapSafety,
-    peakGapRatio,
+    divergence,
   } = params;
 
-  if (remaining < 5) return null;
-
-  const gap = btcPrice - priceToBeat;
-  const absGap = Math.abs(gap);
-  const divergence = params.divergence ?? Infinity;
-
-  if (
-    remaining <= 90 &&
-    atr &&
-    atr <= 2 &&
-    gapSafety &&
-    gapSafety >= 40 &&
-    divergence <= 10 &&
-    peakGapRatio &&
-    peakGapRatio >= 0.75
-  ) {
-    const upCertain = up != null && up.price > 0.85;
-    const downCertain = down != null && down.price > 0.85;
-
-    if (upCertain || downCertain) {
-      const side: "UP" | "DOWN" = upCertain ? "UP" : "DOWN";
-      const info = (side === "UP" ? up : down)!;
-
-      if (info.liquidity < 20) return null;
-
-      return {
-        side,
-        ask: info.price,
-        gap: absGap,
-        liquidity: info.liquidity,
-        stopLossPrice: 0.48,
-      };
-    }
+  if (remaining < 35 || remaining > 150) {
+    return null;
   }
 
-  return null;
+  if (atr === null || atr > 22) {
+    return null;
+  }
+
+  const div = divergence ?? Infinity;
+  if (div > 18) {
+    return null;
+  }
+
+  const gap = btcPrice - priceToBeat;
+
+  const upStrong = up !== null && up.price >= 0.65 && up.liquidity >= 80;
+  const downStrong = down !== null && down.price >= 0.65 && down.liquidity >= 80;
+
+  if (!upStrong && !downStrong) {
+    return null;
+  }
+
+  // If both are strong, choose the one with higher ask*liquidity score.
+  let side: "UP" | "DOWN";
+  let info: { price: number; liquidity: number };
+
+  if (upStrong && downStrong) {
+    const upScore = up!.price * up!.liquidity;
+    const downScore = down!.price * down!.liquidity;
+    side = upScore >= downScore ? "UP" : "DOWN";
+    info = side === "UP" ? up! : down!;
+  } else if (upStrong) {
+    side = "UP";
+    info = up!;
+  } else {
+    side = "DOWN";
+    info = down!;
+  }
+
+  // Direction sanity vs current gap.
+  if (side === "UP" && gap < -20) {
+    return null;
+  }
+  if (side === "DOWN" && gap > 20) {
+    return null;
+  }
+
+  const stopLossPrice =
+    info.price >= 0.65 ? Math.max(0.05, info.price - 0.10) : 0.50;
+
+  return {
+    side,
+    ask: info.price,
+    gap: Math.abs(gap),
+    liquidity: info.liquidity,
+    stopLossPrice,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -396,13 +584,27 @@ function placeEntry(
       req: { tokenId, action: "buy", price: signal.ask, shares: size },
       expireAtMs: ctx.slotEndMs,
       onFilled(filledShares) {
+        const entryBid = ctx.orderBook.bestBidPrice(signal.side) ?? signal.ask - 0.03;
+
+        // Fixed stop at entry - 0.20; hard floor at 0.50
+        const initialStop = Math.max(0.50, signal.ask - 0.20);
+
         state.position = {
           side: signal.side,
           tokenId,
           entryPrice: signal.ask,
+          entryBid,
           shares: filledShares,
-          stopLossPrice: signal.stopLossPrice,
+          stopLossPrice: initialStop,
+          maxSeenBid: entryBid,
+          prevBid: null,
+          breakEvenLocked: false,
+          gapRevTicks: 0,
+          stopBreachTicks: 0,
         };
+        state.stopLossFired = false;
+        state.exitInProgress = false;
+
         ctx.log(
           `[${ctx.slug}] late-entry: BUY ${signal.side} filled @ ${signal.ask} (${filledShares} shares)`,
           "green",
@@ -431,77 +633,298 @@ function checkStopLoss(
   state: LateEntryState,
   remaining: number,
   gap: number | null,
-  rsi: number | null,
+  _rsi: number | null,
+  _releaseLock: () => void,
 ): void {
   const pos = state.position;
-  if (!pos) return;
+  if (!pos || state.stopLossFired || state.exitInProgress) return;
 
+  const currentBid = ctx.orderBook.bestBidPrice(pos.side) ?? null;
   const bestAsk = ctx.orderBook.bestAskInfo(pos.side)?.price ?? null;
-  const bestBid = ctx.orderBook.bestBidPrice(pos.side);
+  const spread =
+    bestAsk != null && currentBid != null ? bestAsk - currentBid : null;
 
-  const GAP_CONFIRM_THRESHOLD = 5;
-  const gapConfirmsPosition =
+  const trackedShares = ctx.getTrackedShares(pos.tokenId);
+  if (trackedShares > 0) {
+    pos.shares = trackedShares;
+  }
+
+  if (currentBid !== null && currentBid > pos.maxSeenBid) {
+    pos.maxSeenBid = currentBid;
+  }
+
+  // Promote stop to 0.92 only once bid reaches 0.97.
+  // Until then the fixed -0.20 stop holds — no trailing, no break-even.
+  if (!pos.breakEvenLocked && pos.maxSeenBid >= 0.97) {
+    pos.stopLossPrice = 0.92;
+    pos.breakEvenLocked = true;
+    ctx.log(
+      `[${ctx.slug}] late-entry: stop promoted to 0.92 (bid hit 0.95, entry=${pos.entryPrice.toFixed(2)})`,
+      "cyan",
+    );
+  }
+
+  // Velocity tracking: store current bid for use next tick, compute single-tick drop.
+  const bidDrop = pos.prevBid !== null && currentBid !== null
+    ? pos.prevBid - currentBid
+    : 0;
+  pos.prevBid = currentBid;
+
+  const gapReversed =
     gap !== null &&
-    ((pos.side === "UP" && gap > GAP_CONFIRM_THRESHOLD) ||
-      (pos.side === "DOWN" && gap < -GAP_CONFIRM_THRESHOLD));
-  const rsiConfirmsMomentum =
-    rsi !== null && (pos.side === "UP" ? rsi >= 50 : rsi <= 50);
+    ((pos.side === "UP" && gap < -10) ||
+      (pos.side === "DOWN" && gap > 10));
 
-  const shouldSell =
-    (remaining <= 80 &&
-      remaining >= 20 &&
-      bestAsk !== null &&
-      bestAsk <= pos.stopLossPrice &&
-      !gapConfirmsPosition &&
-      !rsiConfirmsMomentum) ||
-    (remaining < 20 &&
-      bestAsk !== null &&
-      bestAsk <= pos.stopLossPrice &&
-      !gapConfirmsPosition);
+  // Softer gap threshold used only for velocity crash detection.
+  const softGapReversed =
+    gap !== null &&
+    ((pos.side === "UP" && gap < -5) ||
+      (pos.side === "DOWN" && gap > 5));
 
-  if (!shouldSell) return;
+  if (gapReversed) {
+    pos.gapRevTicks++;
+  } else {
+    pos.gapRevTicks = 0;
+  }
+  const gapRevStable = pos.gapRevTicks >= 3;
 
-  state.stopLossFired = true;
-  state.position = null;
+  const gapIsLarge = gap !== null && Math.abs(gap) > 20;
 
-  const sellPrice =
-    bestBid !== null ? bestBid + 0.01 : pos.stopLossPrice - 0.01;
+  const rawStopBreached =
+    currentBid !== null &&
+    currentBid <= pos.stopLossPrice;
+
+  if (rawStopBreached) {
+    pos.stopBreachTicks++;
+  } else {
+    pos.stopBreachTicks = 0;
+  }
+
+  const stopGap =
+    currentBid !== null ? pos.stopLossPrice - currentBid : 0;
+
+  const bookIsEmpty = remaining < 25 && (currentBid ?? 0) < 0.30;
+
+  // Option B: in the final 90s, if bid already hit 0.95 (breakEvenLocked) and
+  // the BTC gap is still in our direction, hold for resolution.
+  const inResolutionHold =
+    remaining < 90 &&
+    pos.breakEvenLocked &&
+    gap !== null &&
+    ((pos.side === "UP" && gap > 5) ||
+      (pos.side === "DOWN" && gap < -5));
+
+  const stopBreached =
+    !bookIsEmpty &&
+    !inResolutionHold &&
+    rawStopBreached &&
+    (
+      (gapIsLarge && gapRevStable) ||
+      (!gapIsLarge && (!gapReversed || gapRevStable))
+    );
+
+  // Gap confirmed reversed for 3 ticks AND bid is still above entry price —
+  // don't wait for the fixed stop, sell now to protect profit.
+  const panicExit =
+    gapRevStable &&
+    currentBid !== null &&
+    currentBid > pos.entryPrice &&
+    !inResolutionHold;
+
+  // Velocity crash: bid dropped hard in a single tick while gap is already turning.
+  // Fires on first detection — no need to wait for gapRevStable (3 ticks).
+  const velocityCrash =
+    bidDrop >= 0.06 &&
+    softGapReversed &&
+    pos.gapRevTicks >= 1 &&   // gap must be sustained, not a 1-tick noise spike
+    !inResolutionHold;
+
+  // Profit protection: large single-tick bid crash while still in profit.
+  // Gap hasn't reversed yet but money is at risk — get out now.
+  const profitProtectionExit =
+    bidDrop >= 0.07 &&
+    currentBid !== null &&
+    currentBid > pos.entryPrice &&
+    !inResolutionHold;
+
+
+  const nearExpiryFlip =
+    remaining < 25 &&
+    gap !== null &&
+    Math.abs(gap) <= 5 &&
+    (currentBid ?? 0) > 0.30;
+
+  const stopMode = gapIsLarge
+    ? (gapRevStable ? "gap-large-reversed" : "gap-large-protected")
+    : (!gapReversed ? "gap-small-normal" : "gap-small-reversal");
 
   ctx.log(
-    `[${ctx.slug}] late-entry: stop-loss triggered — SELL ${pos.side} @ ${sellPrice}`,
-    "red",
+    `[${ctx.slug}] late-entry: pos-tick` +
+    ` ask=${bestAsk?.toFixed(2) ?? "none"}` +
+    ` bid=${currentBid?.toFixed(2) ?? "none"}` +
+    ` spread=${spread != null ? spread.toFixed(2) : "?"}` +
+    ` gap=${gap?.toFixed(1) ?? "null"}` +
+    ` stop=${pos.stopLossPrice.toFixed(2)}` +
+    ` stopGap=${stopGap.toFixed(2)}` +
+    ` peak=${pos.maxSeenBid.toFixed(2)}` +
+    ` entry=${pos.entryPrice.toFixed(2)}` +
+    ` beLocked=${pos.breakEvenLocked}` +
+    ` trackedShares=${pos.shares.toFixed(6)}` +
+    ` gapRev=${gapReversed}` +
+    ` gapRevTicks=${pos.gapRevTicks}` +
+    ` stopTicks=${pos.stopBreachTicks}` +
+    ` stopMode=${stopMode}` +
+    ` gapIsLarge=${gapIsLarge}` +
+    ` gapRevStable=${gapRevStable}` +
+    ` bookEmpty=${bookIsEmpty}` +
+    ` resolutionHold=${inResolutionHold}`,
+    "dim",
   );
 
-  ctx.postOrders([
-    {
-      force: false,
-      req: {
-        tokenId: pos.tokenId,
-        action: "sell",
-        price: sellPrice,
-        shares: pos.shares,
+  // const shouldSell = nearExpiryFlip || stopBreached || panicExit || velocityCrash || profitProtectionExit;
+  const shouldSell = false;
+  if (!shouldSell) return;
+
+  const exitReason = nearExpiryFlip
+    ? `near-expiry coin-flip (gap=${gap?.toFixed(1)}, remaining=${remaining}s)`
+    : panicExit
+      ? `panic-exit (gapRevStable, bid=${currentBid?.toFixed(2)}, peak=${pos.maxSeenBid.toFixed(2)}, entry=${pos.entryPrice.toFixed(2)}, gap=${gap?.toFixed(1)})`
+      : velocityCrash
+        ? `velocity-crash (bidDrop=${bidDrop.toFixed(2)}/tick, bid=${currentBid?.toFixed(2)}, gap=${gap?.toFixed(1)}, entry=${pos.entryPrice.toFixed(2)})`
+        : profitProtectionExit
+          ? `profit-protection (bidDrop=${bidDrop.toFixed(2)}/tick, bid=${currentBid?.toFixed(2)}, peak=${pos.maxSeenBid.toFixed(2)}, entry=${pos.entryPrice.toFixed(2)})`
+          : `stop-loss @ ${pos.stopLossPrice.toFixed(2)} (mode=${stopMode}, stopGap=${stopGap.toFixed(2)}, peakBid=${pos.maxSeenBid.toFixed(2)}, entry=${pos.entryPrice.toFixed(2)}, beLocked=${pos.breakEvenLocked})`;
+
+  state.stopLossFired = true;
+  state.exitInProgress = true;
+
+  const tokenId = pos.tokenId;
+  const side = pos.side;
+  const DUST_SHARES = 0.5;
+
+  let exitClosed = false;
+
+  const resetAfterExit = (message?: string, color: "green" | "yellow" = "green") => {
+    if (exitClosed) {
+      return;
+    }
+
+    exitClosed = true;
+    state.position = null;
+    state.stopLossFired = false;
+    state.exitInProgress = false;
+
+    if (message) {
+      ctx.log(message, color);
+    }
+  };
+
+  const tryExit = () => {
+    if (exitClosed) {
+      return;
+    }
+
+    if (Date.now() >= ctx.slotEndMs) {
+      resetAfterExit(
+        `[${ctx.slug}] late-entry: exit abandoned — slot ended [${exitReason}]`,
+        "yellow",
+      );
+      return;
+    }
+
+    const targetShares = ctx.getTrackedShares(tokenId);
+    if (targetShares <= DUST_SHARES) {
+      resetAfterExit(
+        `[${ctx.slug}] late-entry: exit complete — remaining shares treated as dust (${targetShares.toFixed(6)}) [${exitReason}]`,
+        "yellow",
+      );
+      return;
+    }
+
+    const bestBid = ctx.orderBook.bestBidPrice(side);
+    const sellPrice = bestBid !== null ? bestBid : 0.02;
+
+    ctx.log(
+      `[${ctx.slug}] late-entry: GTC exit — SELL ${side} @ ${sellPrice} (${targetShares} shares) [${exitReason}]`,
+      "red",
+    );
+
+    ctx.postOrders([
+      {
+        req: {
+          tokenId,
+          action: "sell",
+          price: sellPrice,
+          shares: targetShares,
+          orderType: "GTC",
+        },
+        expireAtMs: Date.now() + 2000,
+        onFilled(filledShares) {
+          if (exitClosed) {
+            return;
+          }
+
+          const remainingShares = ctx.getTrackedShares(tokenId);
+          if (remainingShares > DUST_SHARES) {
+            // partial fill — retry for the remainder
+            tryExit();
+            return;
+          }
+
+          resetAfterExit(
+            `[${ctx.slug}] late-entry: exit SELL filled @ ${sellPrice} (${filledShares} shares)`,
+            "green",
+          );
+        },
+        onExpired() {
+          if (exitClosed) {
+            return;
+          }
+          tryExit();
+        },
+        onFailed(reason) {
+          if (exitClosed) {
+            return;
+          }
+
+          const latestTrackedShares = ctx.getTrackedShares(tokenId);
+
+          if (latestTrackedShares <= DUST_SHARES) {
+            resetAfterExit(
+              `[${ctx.slug}] late-entry: exit complete — remaining shares treated as dust (${latestTrackedShares.toFixed(6)}) [${exitReason}]`,
+              "yellow",
+            );
+            return;
+          }
+
+          if (reason.includes("not enough balance")) {
+            setTimeout(() => {
+              if (!exitClosed) {
+                tryExit();
+              }
+            }, 400);
+            return;
+          }
+
+          if (reason.includes("invalid amounts")) {
+            resetAfterExit(
+              `[${ctx.slug}] late-entry: exit stopped — remaining shares below executable size (${latestTrackedShares.toFixed(6)}) [${exitReason}]`,
+              "yellow",
+            );
+            return;
+          }
+
+          setTimeout(() => {
+            if (!exitClosed) {
+              tryExit();
+            }
+          }, 400);
+        },
       },
-      expireAtMs: ctx.slotEndMs,
-      onFilled() {
-        ctx.log(
-          `[${ctx.slug}] late-entry: stop-loss SELL filled @ ${sellPrice}`,
-          "green",
-        );
-      },
-      onExpired() {
-        ctx.log(
-          `[${ctx.slug}] late-entry: stop-loss SELL expired — emergency selling`,
-          "red",
-        );
-        const sellIds = ctx.pendingOrders
-          .filter((o) => o.action === "sell")
-          .map((o) => o.orderId);
-        if (sellIds.length > 0) {
-          ctx.emergencySells(sellIds);
-        }
-      },
-    },
-  ]);
+    ]);
+  };
+
+  tryExit();
 }
 
 // ---------------------------------------------------------------------------
@@ -509,59 +932,95 @@ function checkStopLoss(
 // ---------------------------------------------------------------------------
 
 export const lateEntry: Strategy = async (ctx) => {
-  // This strategy is now enabled for production use.
-
-  // ── ctx.hold() ────────────────────────────────────────────────────────────
-  // By default, the engine transitions out of RUNNING as soon as the strategy
-  // function returns. Since this strategy is event-driven (it reacts to price
-  // ticks over the life of the market), we need to keep the lifecycle in
-  // RUNNING until we are truly done.
-  //
-  // ctx.hold() increments an internal counter and returns a release function.
-  // The lifecycle will not exit RUNNING until every active hold has been
-  // released. Call release() exactly once when your strategy has no more work
-  // to do (position closed, stop-loss fired, or time ran out). Forgetting to
-  // call it will cause the engine to hang after the market closes.
   const releaseLock = ctx.hold();
 
   const state: LateEntryState = {
     hasEntered: false,
     position: null,
     stopLossFired: false,
+    exitInProgress: false,
+    hadPosition: false,
+    released: false,
+    signalConfirmTicks: 0,
   };
   const indicators = new Indicators();
   let lastNoSignalLogAt = 0;
+  let frozenPriceTicks = 0;
+  let lastSeenLivePrice: number | undefined = undefined;
+  const FROZEN_PRICE_MAX_TICKS = 15; // 15 seconds of no price change → restart
 
   const tickInterval = setInterval(() => {
     const remaining = Math.floor((ctx.slotEndMs - Date.now()) / 1000);
     if (remaining <= 0) {
       clearInterval(tickInterval);
-      releaseLock();
+      if (!state.released) {
+        state.released = true;
+        releaseLock();
+      }
       return;
     }
 
-    if (remaining <= 5 && !state.position) {
+    // Single-trade mode: stop only after we actually had a live position
+    // and that position has fully exited.
+    if (state.hadPosition && !state.position && !state.exitInProgress) {
       clearInterval(tickInterval);
-      releaseLock();
+      if (!state.released) {
+        state.released = true;
+        releaseLock();
+      }
       return;
     }
 
-    const btcPrice = ctx.ticker.price;
+    if (remaining <= 5 && !state.position && !state.exitInProgress) {
+      clearInterval(tickInterval);
+      if (!state.released) {
+        state.released = true;
+        releaseLock();
+      }
+      return;
+    }
+
+    const oraclePrice = ctx.ticker.price;
     const binancePrice = ctx.ticker.binancePrice;
     const coinbasePrice = ctx.ticker.coinbasePrice;
     const priceToBeat = ctx.getMarketResult()?.openPrice ?? null;
     const up = ctx.orderBook.bestAskInfo("UP");
     const down = ctx.orderBook.bestAskInfo("DOWN");
 
-    if (btcPrice === undefined || priceToBeat === null) {
+    // Use live exchange prices (binance + coinbase average) for gap/indicator computation.
+    // The Polymarket oracle price updates infrequently and causes RSI/ATR to freeze at 0.
+    // Weight Coinbase 90% / Binance 10% — Polymarket's oracle uses Coinbase as its
+    // primary source, so this best reflects the gap at settlement.
+    const liveBtcPrice: number | undefined =
+      binancePrice !== undefined && coinbasePrice !== undefined
+        ? coinbasePrice * 0.95 + binancePrice * 0.05
+        : coinbasePrice ?? binancePrice ?? oraclePrice;
+
+    // Detect frozen price feed and restart the process.
+    if (liveBtcPrice !== undefined) {
+      if (liveBtcPrice === lastSeenLivePrice) {
+        frozenPriceTicks++;
+        if (frozenPriceTicks >= FROZEN_PRICE_MAX_TICKS) {
+          ctx.log(
+            `[${ctx.slug}] late-entry: price feed frozen for ${frozenPriceTicks}s (stuck at ${liveBtcPrice}) — restarting process`,
+            "red",
+          );
+          process.exit(1); // PM2/systemd will restart automatically
+        }
+      } else {
+        frozenPriceTicks = 0;
+        lastSeenLivePrice = liveBtcPrice;
+      }
+    }
+
+    if (liveBtcPrice === undefined || priceToBeat === null) {
       const now = Date.now();
       const secsToOpen = Math.ceil((ctx.slotStartMs - now) / 1000);
       const secsSinceOpen = Math.max(0, Math.floor((now - ctx.slotStartMs) / 1000));
-    
+
       if (now - lastNoSignalLogAt >= NO_SIGNAL_LOG_INTERVAL_MS) {
         lastNoSignalLogAt = now;
-    
-        // Distinguish pre-open from post-open missing-openPrice.
+
         if (secsToOpen > 0) {
           ctx.log(
             `[${ctx.slug}] late-entry: pre-open wait (opens in ${secsToOpen}s)`,
@@ -569,8 +1028,7 @@ export const lateEntry: Strategy = async (ctx) => {
           );
           return;
         }
-    
-        // Post-open grace window: API can legitimately lag.
+
         if (priceToBeat === null && secsSinceOpen <= OPEN_PRICE_GRACE_AFTER_OPEN_S) {
           ctx.log(
             `[${ctx.slug}] late-entry: open price pending (${secsSinceOpen}s since open)`,
@@ -578,23 +1036,25 @@ export const lateEntry: Strategy = async (ctx) => {
           );
           return;
         }
-    
-        // Hard timeout: if open price still missing too long, skip this round safely.
+
         if (priceToBeat === null && secsSinceOpen >= OPEN_PRICE_HARD_TIMEOUT_S) {
           ctx.log(
             `[${ctx.slug}] late-entry: open price unavailable after ${secsSinceOpen}s — skipping round`,
             "red",
           );
           clearInterval(tickInterval);
-          releaseLock();
+          if (!state.released) {
+            state.released = true;
+            releaseLock();
+          }
           return;
         }
-    
-        // Fallback diagnostic log for all other missing-data states.
+
         ctx.log(
           `[${ctx.slug}] late-entry: waiting — ${explainNoSignal({
             remaining,
-            btcPrice,
+            btcPrice: liveBtcPrice,
+            oraclePrice,
             priceToBeat,
             up,
             down,
@@ -613,39 +1073,81 @@ export const lateEntry: Strategy = async (ctx) => {
       return;
     }
 
-    const gap = btcPrice - priceToBeat;
-    indicators.tick(gap, btcPrice);
+    const gap = liveBtcPrice - priceToBeat;
+    indicators.tick(gap, liveBtcPrice);
 
-    if (!state.hasEntered) {
-      const signal = checkEntry({
-        remaining,
-        btcPrice,
-        priceToBeat,
-        up,
-        down,
-        rsi: indicators.rsi,
-        atr: indicators.atr,
-        rtv: indicators.rtv,
-        gapSafety: indicators.gapSafety(gap),
-        divergence: ctx.ticker.divergence,
-        peakGapRatio: indicators.peakGapRatio(gap),
-      });
+    const canEnter =
+      !state.hasEntered &&
+      !state.exitInProgress;
+
+    if (canEnter) {
+      const signal = ENTRY_STRATEGY === "v2"
+        ? checkEntryV2({
+          remaining,
+          btcPrice: liveBtcPrice,
+          priceToBeat,
+          up,
+          down,
+          rsi: indicators.rsi,
+          atr: indicators.atr,
+          rtv: indicators.rtv,
+          gapSafety: indicators.gapSafety(gap),
+          divergence: ctx.ticker.divergence,
+          peakGapRatio: indicators.peakGapRatio(gap),
+        })
+        : checkEntry({
+          remaining,
+          btcPrice: liveBtcPrice,
+          priceToBeat,
+          up,
+          down,
+          rsi: indicators.rsi,
+          atr: indicators.atr,
+          rtv: indicators.rtv,
+          gapSafety: indicators.gapSafety(gap),
+          divergence: ctx.ticker.divergence,
+          peakGapRatio: indicators.peakGapRatio(gap),
+        });
 
       if (signal) {
-        state.hasEntered = true;
-        ctx.log(
-          `[${ctx.slug}] late-entry: signal ${signal.side} @ ${signal.ask} (gap ${signal.gap.toFixed(0)}, liq $${signal.liquidity.toFixed(0)})`,
-          "cyan",
-        );
-        placeEntry(ctx, state, signal);
+        // Spread gate: wide spread = thin book = high slippage risk, skip.
+        const currentBid = ctx.orderBook.bestBidPrice(signal.side);
+        const spread = currentBid !== null ? signal.ask - currentBid : Infinity;
+
+        if (spread > 0.04) {
+          state.signalConfirmTicks = 0;
+          ctx.log(
+            `[${ctx.slug}] late-entry: no signal — spread_too_wide (ask=${signal.ask.toFixed(2)}, bid=${currentBid?.toFixed(2)}, spread=${spread.toFixed(2)})`,
+            "yellow",
+          );
+        } else {
+          state.signalConfirmTicks++;
+
+          if (state.signalConfirmTicks >= 1) {
+            state.hasEntered = true;
+            state.signalConfirmTicks = 0;
+            ctx.log(
+              `[${ctx.slug}] late-entry: signal ${signal.side} @ ${signal.ask} (gap ${signal.gap.toFixed(0)}, liq $${signal.liquidity.toFixed(0)})`,
+              "cyan",
+            );
+            placeEntry(ctx, state, signal);
+          } else {
+            ctx.log(
+              `[${ctx.slug}] late-entry: signal_pending (1/2) — ${signal.side} @ ${signal.ask.toFixed(2)} spread=${spread.toFixed(2)} gap=${signal.gap.toFixed(0)}`,
+              "yellow",
+            );
+          }
+        }
       } else {
+        state.signalConfirmTicks = 0;
         const now = Date.now();
         if (now - lastNoSignalLogAt >= NO_SIGNAL_LOG_INTERVAL_MS) {
           lastNoSignalLogAt = now;
           ctx.log(
             `[${ctx.slug}] late-entry: no signal — ${explainNoSignal({
               remaining,
-              btcPrice,
+              btcPrice: liveBtcPrice,
+              oraclePrice,
               priceToBeat,
               up,
               down,
@@ -664,12 +1166,20 @@ export const lateEntry: Strategy = async (ctx) => {
       }
     }
 
-    if (state.position && !state.stopLossFired) {
-      checkStopLoss(ctx, state, remaining, gap, indicators.rsi);
+    if (state.position) {
+      state.hadPosition = true;
+    }
+
+    if (state.position && !state.stopLossFired && !state.exitInProgress) {
+      checkStopLoss(ctx, state, remaining, gap, indicators.rsi, releaseLock);
     }
   }, 1000);
 
   return () => {
     clearInterval(tickInterval);
+    if (!state.released) {
+      state.released = true;
+      releaseLock();
+    }
   };
 };

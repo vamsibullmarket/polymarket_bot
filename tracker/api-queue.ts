@@ -44,33 +44,13 @@ export class APIQueue {
   }
 
   async queueEventDetails(slug: string) {
-    const endpoint = `https://gamma-api.polymarket.com/events?slug=${slug}`;
-    console.log(`[api-queue] event request slug=${slug} url=${endpoint}`);
-  
-    const res = await fetchWithRetry(endpoint);
-    const raw = await res.text();
-  
-    // FULL RAW RESPONSE BODY
-    console.log(`[api-queue] event response slug=${slug} status=${res.status} body=${raw}`);
-  
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (e) {
-      console.log(`[api-queue] event parse_error slug=${slug} err=${String(e)}`);
-      throw e;
-    }
-  
-    const list = parsed as any[];
-    const event: EventResponse | undefined = list?.[0];
-  
-    if (!event) {
-      throw new Error(`No event found for slug=${slug}`);
-    }
-  
+    const res = await fetchWithRetry(
+      `https://gamma-api.polymarket.com/events?slug=${slug}`,
+    );
+    const event: EventResponse = ((await res.json()) as any[])[0];
     this.eventResponse.set(slug, event);
   }
-
+  
   queueMarketPrice(slot: Slot): { cancel: () => void } {
     if (this._queuedSlots.has(slot.startTime)) return { cancel: () => {} };
     this._queuedSlots.add(slot.startTime);
@@ -78,18 +58,11 @@ export class APIQueue {
     const { startTime, endTime } = slot;
     const controller = new AbortController();
   
-    const slotStartSec = Math.floor(startTime / 1000);
-    const slotEndSec = Math.floor(endTime / 1000);
-  
     const url = new URL("https://polymarket.com/api/crypto/crypto-price");
     url.searchParams.set("symbol", Env.getAssetConfig().apiSymbol);
     url.searchParams.set("variant", "fiveminute");
     url.searchParams.set("eventStartTime", startTime.toString());
     url.searchParams.set("endDate", endTime.toString());
-  
-    console.log(
-      `[api-queue] request slotStartMs=${startTime} slotEndMs=${endTime} slotStartSec=${slotStartSec} slotEndSec=${slotEndSec} url=${url.toString()}`,
-    );
   
     fetchWithRetry(url, {
       options: { headers: { Accept: "application/json" } },
@@ -97,45 +70,31 @@ export class APIQueue {
       totalRetry: Number.MAX_VALUE,
       abort: controller.signal,
       resolveWhen: async (res) => {
-        const raw = await res.text();
-  
-        // FULL RAW RESPONSE BODY
-        console.log(
-          `[api-queue] response status=${res.status} slotStartMs=${startTime} body=${raw}`,
-        );
-  
-        let data: MarketData & {
+        const data = (await res.json()) as MarketData & {
           timestamp?: number;
           completed?: boolean;
           incomplete?: boolean;
           cached?: boolean;
         };
   
-        try {
-          data = JSON.parse(raw);
-        } catch (e) {
-          console.log(
-            `[api-queue] parse_error slotStartMs=${startTime} err=${String(e)}`,
-          );
-          throw e;
-        }
+        // Persist every response so open/close keep refreshing over time.
+        const prev = this.marketResult.get(slot.startTime);
+        this.marketResult.set(slot.startTime, {
+          startTime,
+          endTime,
+          completed: Boolean(data.completed),
+          openPrice: data.openPrice ?? prev?.openPrice ?? null,
+          closePrice: data.closePrice ?? prev?.closePrice ?? null,
+        } as MarketData);
   
-        if (data.openPrice != null) {
-          this.marketResult.set(slot.startTime, data);
-          console.log(
-            `[api-queue] open_ready slotStartMs=${startTime} open=${data.openPrice} close=${data.closePrice}`,
-          );
+        // Keep retrying until close is available (market fully resolved).
+        if (data.closePrice != null) {
           return data;
         }
   
-        throw new Error("Open price not set yet");
+        throw new Error("Market not resolved yet (closePrice missing)");
       },
-      retryBackOff: (currentRetry) => {
-        if (this.marketResult.get(slot.startTime)) {
-          return 8000;
-        }
-        return currentRetry * 500;
-      },
+      retryBackOff: () => 1500,
     });
   
     return { cancel: () => controller.abort() };

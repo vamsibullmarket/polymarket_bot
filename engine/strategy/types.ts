@@ -32,6 +32,11 @@ export type StrategyContext = {
 
   getOrderById: (orderId: string) => Promise<Order | null>;
   /**
+   * Returns the lifecycle's latest tracked share count for a token.
+   * This is updated on fills and heartbeat reconciliation.
+   */
+  getTrackedShares: (tokenId: string) => number;
+  /**
    * Fire-and-forget order placement. Returns immediately — do not use the
    * return value to determine if an order was placed. Use `onFilled` to react
    * to a successful fill and `onExpired` to react to a cancellation or failed

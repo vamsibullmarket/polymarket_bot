@@ -85,13 +85,6 @@ export async function fetchWithRetry<T = Response>(
       return undefined as T;
     }
 
-    // CRITICAL: log every retry failure so we can see what's happening
-    console.log(
-      `[fetchWithRetry] retry=${currentRetry} useCurl=${Boolean(
-        _params.useCurl,
-      )} url=${url.toString()} err=${String(e)}`,
-    );
-
     if (retryTimes - currentRetry <= 0) {
       throw e;
     }

@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync } from "fs";
+import { appendFileSync, mkdirSync, readdirSync, unlinkSync, statSync } from "fs";
 import { join } from "path";
 
 export type LogColor = "green" | "yellow" | "red" | "cyan" | "dim";
@@ -28,6 +28,24 @@ class Log {
       .replace(/:/g, "-")
       .slice(0, 19);
     this._filePath = join("logs", `early-bird-${tag}.log`);
+    this._pruneOldLogs();
+  }
+
+  /** Keep only the 20 most recent log files, delete the rest. */
+  private _pruneOldLogs(): void {
+    try {
+      const dir = "logs";
+      const files = readdirSync(dir)
+        .filter((f) => f.startsWith("early-bird-") && f.endsWith(".log"))
+        .map((f) => ({ name: f, mtime: statSync(join(dir, f)).mtimeMs }))
+        .sort((a, b) => b.mtime - a.mtime);
+
+      for (const file of files.slice(20)) {
+        unlinkSync(join(dir, file.name));
+      }
+    } catch {
+      // Non-fatal — log pruning is best-effort
+    }
   }
 
   write(msg: string, color?: LogColor): void {
