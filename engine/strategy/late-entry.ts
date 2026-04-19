@@ -238,11 +238,15 @@ const OPEN_PRICE_HARD_TIMEOUT_S = 90;
 
 const ENTRY_STRATEGY: "v1" | "v2" = "v2";
 
-/** Only when `remaining < 25`: tight band + liquidity (see `checkEntryV2FinalStretch`). */
+/** When `remaining <` this, use `checkEntryV2FinalStretch`. */
 const TIGHT_ENTRY_REMAINING_THRESHOLD = 35;
-const TIGHT_ENTRY_PRICE_MIN = 0.80;
+/** Final-stretch CLOB band (inclusive) and liquidity floor. */
+const TIGHT_ENTRY_PRICE_MIN = 0.75;
 const TIGHT_ENTRY_PRICE_MAX = 0.9;
-const TIGHT_ENTRY_MIN_LIQUIDITY = 80;
+const TIGHT_ENTRY_MIN_LIQUIDITY = 120;
+
+const FINAL_STRETCH_PEAK_GAP_RATIO_MIN = 0.55;
+const FINAL_STRETCH_GAP_SAFETY_MIN = 8;
 
 /** CLOB mid on your outcome token — tune if most rows are uncertain. */
 const SETTLEMENT_PREVIEW_WIN_MIN = 0.98;
@@ -439,12 +443,27 @@ function explainNoSignal(params: {
     } else if (params.remaining < 1) {
       reasons.push(`too_late(remaining=${params.remaining}s)`);
     } else if (isV2FinalStretch) {
-      // Mirror checkEntryV2FinalStretch (remaining 1..24)
+      // Mirror checkEntryV2FinalStretch
       if (params.atr === null) reasons.push("atr_not_ready");
       else if (params.atr > 22) reasons.push(`atr_too_high=${params.atr.toFixed(2)}`);
 
-      if (params.divergence !== null && params.divergence > 18) {
-        reasons.push(`divergence_too_high=${params.divergence.toFixed(2)}`);
+      const div = params.divergence ?? Infinity;
+      if (div > 18) {
+        reasons.push(`divergence_too_high=${params.divergence?.toFixed(2) ?? "na"}`);
+      }
+
+      if (
+        params.peakGapRatio !== null &&
+        params.peakGapRatio < FINAL_STRETCH_PEAK_GAP_RATIO_MIN
+      ) {
+        reasons.push(`peak_gap_ratio_low=${params.peakGapRatio.toFixed(2)}`);
+      }
+
+      if (
+        params.gapSafety !== null &&
+        params.gapSafety < FINAL_STRETCH_GAP_SAFETY_MIN
+      ) {
+        reasons.push(`gap_safety_low=${params.gapSafety.toFixed(2)}`);
       }
 
       const inTightBand = (p: { price: number; liquidity: number } | null) =>
@@ -505,7 +524,6 @@ function explainNoSignal(params: {
         }
       }
     } else if (ENTRY_STRATEGY === "v1") {
-      // V1 conditions
       if (params.atr === null) reasons.push("atr_not_ready");
       else if (params.atr > 22) reasons.push(`atr_too_high=${params.atr.toFixed(2)}`);
 
@@ -518,11 +536,18 @@ function explainNoSignal(params: {
       if (upStrong && gap < -20) reasons.push(`gap_contradicts_up(gap=${gap.toFixed(0)})`);
       if (downStrong && !upStrong && gap > 20) reasons.push(`gap_contradicts_down(gap=${gap.toFixed(0)})`);
     } else {
-      // V2 normal window (remaining >= 25)
+      // Mirror checkEntryV2 normal path: 35 <= remaining <= 150
+      if (params.remaining < 35 || params.remaining > 150) {
+        reasons.push(`outside_v2_normal_window(need_35-150_remaining=${params.remaining})`);
+      }
+
       if (params.atr === null) reasons.push("atr_not_ready");
       else if (params.atr > 22) reasons.push(`atr_too_high=${params.atr.toFixed(2)}`);
 
-      if (params.divergence !== null && params.divergence > 18) reasons.push(`divergence_too_high=${params.divergence.toFixed(2)}`);
+      const div = params.divergence ?? Infinity;
+      if (div > 18) {
+        reasons.push(`divergence_too_high=${params.divergence?.toFixed(2) ?? "na"}`);
+      }
 
       if (params.rsi === null) {
         reasons.push("rsi_not_ready");
@@ -557,19 +582,26 @@ function explainNoSignal(params: {
           }
 
           if (Math.abs(gap) < 25) reasons.push(`gap_too_small(${gap.toFixed(1)})`);
-          if (info.liquidity < 120) reasons.push(`liq_too_low=${info.liquidity.toFixed(0)}`);
-          if (side === "UP" && params.rsi < 55) reasons.push(`rsi_contradicts_up(rsi=${params.rsi.toFixed(1)})`);
-          if (side === "DOWN" && params.rsi > 45) reasons.push(`rsi_contradicts_down(rsi=${params.rsi.toFixed(1)})`);
-          if (side === "UP" && gap < -8) reasons.push(`gap_contradicts_up(gap=${gap.toFixed(0)})`);
-          if (side === "DOWN" && gap > 8) reasons.push(`gap_contradicts_down(gap=${gap.toFixed(0)})`);
-          if (info.price < 0.55) reasons.push(`price_too_low=${info.price.toFixed(2)}`);
-          if (info.price > 0.9) reasons.push(`price_too_high=${info.price.toFixed(2)}`);
-          if (info.liquidity < 80) reasons.push(`liq_too_low=${info.liquidity.toFixed(0)}`);
           if (params.peakGapRatio !== null && params.peakGapRatio < 0.55) {
             reasons.push(`peak_gap_ratio_low=${params.peakGapRatio.toFixed(2)}`);
           }
           if (params.gapSafety !== null && params.gapSafety < 8) {
             reasons.push(`gap_safety_low=${params.gapSafety.toFixed(2)}`);
+          }
+          if (info.liquidity < 80) reasons.push(`liq_too_low=${info.liquidity.toFixed(0)}`);
+          if (side === "UP" && params.rsi < 35) {
+            reasons.push(`rsi_contradicts_up(rsi=${params.rsi.toFixed(1)})`);
+          }
+          if (side === "DOWN" && params.rsi > 65) {
+            reasons.push(`rsi_contradicts_down(rsi=${params.rsi.toFixed(1)})`);
+          }
+          if (side === "UP" && gap < -8) reasons.push(`gap_contradicts_up(gap=${gap.toFixed(0)})`);
+          if (side === "DOWN" && gap > 8) reasons.push(`gap_contradicts_down(gap=${gap.toFixed(0)})`);
+          if (info.price < 0.74 || info.price > 0.9) {
+            reasons.push(`price_outside_band=${info.price.toFixed(2)}(need_0.74-0.90)`);
+          }
+          if (params.atr !== null && params.atr < 0.05) {
+            reasons.push(`atr_frozen_low=${params.atr.toFixed(2)}`);
           }
         }
       }
@@ -585,8 +617,8 @@ function sharesForNotional(price: number, notionalUsd = TARGET_ORDER_USD): numbe
 }
 
 /**
- * Last ~24s of the entry window (`remaining` in 1..24): high CLOB price on one side only.
- * Does not use min-|gap|, peak-gap, or gapSafety — those stay on the normal `checkEntryV2` path.
+ * When `remaining < TIGHT_ENTRY_REMAINING_THRESHOLD`: CLOB band [TIGHT_ENTRY_PRICE_MIN, TIGHT_ENTRY_PRICE_MAX],
+ * liquidity >= TIGHT_ENTRY_MIN_LIQUIDITY, plus peakGap / gapSafety when present (same thresholds as normal V2).
  */
 function checkEntryV2FinalStretch(params: {
   remaining: number;
@@ -613,6 +645,20 @@ function checkEntryV2FinalStretch(params: {
   }
 
   const gap = btcPrice - priceToBeat;
+
+  if (
+    params.peakGapRatio !== null &&
+    params.peakGapRatio < FINAL_STRETCH_PEAK_GAP_RATIO_MIN
+  ) {
+    return null;
+  }
+
+  if (
+    params.gapSafety !== null &&
+    params.gapSafety < FINAL_STRETCH_GAP_SAFETY_MIN
+  ) {
+    return null;
+  }
 
   const inTightBand = (p: { price: number; liquidity: number } | null) =>
     p !== null &&
