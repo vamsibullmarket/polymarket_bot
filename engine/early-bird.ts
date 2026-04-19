@@ -82,39 +82,21 @@ export class EarlyBird {
     }
   }
 
-  private _writeWinningSlugsDump(): void {
-    mkdirSync(dirname(WINNING_SLUGS_PATH), { recursive: true });
-
-    // Keep what is already on disk so startup/state-recovery doesn't wipe winners.
-    const existing = existsSync(WINNING_SLUGS_PATH)
-      ? readFileSync(WINNING_SLUGS_PATH, "utf8")
-        .split("\n")
-        .map((s) => s.trim())
-        .filter(Boolean)
-      : [];
-
-    const existingSet = new Set(existing);
-
-    // New winners from this process/runtime.
-    const currentWinners = this._completedMarkets
-      .filter((m) => m.pnl > 0 && m.slug.startsWith("btc-updown-5m-"))
-      .map((m) => m.slug);
-
-    // Preserve file order; append only truly new winners.
-    const merged = [...existing];
-    for (const slug of currentWinners) {
-      if (!existingSet.has(slug)) {
-        existingSet.add(slug);
-        merged.push(slug);
-      }
-    }
-
-    // If nothing changed, don't rewrite.
-    if (merged.length === existing.length) {
+  private _appendWinningSlugToFile(slug: string): void {
+    if (!slug.startsWith("btc-updown-5m-")) {
       return;
     }
-
-    const body = merged.length > 0 ? `${merged.join("\n")}\n` : "";
+    mkdirSync(dirname(WINNING_SLUGS_PATH), { recursive: true });
+    const existing = existsSync(WINNING_SLUGS_PATH)
+      ? readFileSync(WINNING_SLUGS_PATH, "utf8")
+          .split("\n")
+          .map((s) => s.trim())
+          .filter(Boolean)
+      : [];
+    if (existing.includes(slug)) {
+      return;
+    }
+    const body = `${[...existing, slug].join("\n")}\n`;
     writeFileSync(WINNING_SLUGS_PATH, body, "utf8");
   }
 
@@ -332,6 +314,9 @@ export class EarlyBird {
         pnl: lifecycle.pnl,
         orderHistory: lifecycle.orderHistory,
       });
+      if (lifecycle.pnl > 0) {
+        this._appendWinningSlugToFile(slug);
+      }
       const ml = this._marketLogs.get(slug);
       if (ml) {
         ml.done();
@@ -408,8 +393,5 @@ export class EarlyBird {
       activeMarkets,
       completedMarkets: this._completedMarkets,
     });
-
-    // Keep a plain-text winners list for quick claim workflows.
-    this._writeWinningSlugsDump();
   }
 }

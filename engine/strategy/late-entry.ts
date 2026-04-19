@@ -209,6 +209,9 @@ type LateEntryPosition = {
   breakEvenLocked: boolean;
   gapRevTicks: number;
   stopBreachTicks: number;
+  // On LateEntryPosition type:
+  lossSalvageGaps: Array<{ t: number; gap: number }>;
+  lossSalvageAdverseStreak: number;
 };
 
 type LateEntryState = {
@@ -242,7 +245,7 @@ const ENTRY_STRATEGY: "v1" | "v2" = "v2";
 const TIGHT_ENTRY_REMAINING_THRESHOLD = 35;
 /** Final-stretch CLOB band (inclusive) and liquidity floor. */
 const TIGHT_ENTRY_PRICE_MIN = 0.75;
-const TIGHT_ENTRY_PRICE_MAX = 0.9;
+const TIGHT_ENTRY_PRICE_MAX = 0.91;
 const TIGHT_ENTRY_MIN_LIQUIDITY = 120;
 
 const FINAL_STRETCH_PEAK_GAP_RATIO_MIN = 0.55;
@@ -991,6 +994,9 @@ function placeEntry(
           breakEvenLocked: false,
           gapRevTicks: 0,
           stopBreachTicks: 0,
+          // In onFilled, inside state.position = { ... }
+          lossSalvageGaps: [],
+          lossSalvageAdverseStreak: 0,
         };
         state.lastTradeSide = signal.side;
         state.stopLossFired = false;
@@ -1019,6 +1025,98 @@ function placeEntry(
   ]);
 }
 
+const LOSS_SALVAGE_CFG = {
+  lightUsd: 10,
+  strongUsd: 30,
+  lookbackMs: 60_000,
+  finalRemainingSec: 30,
+  strongPhaseRemainingSec: 60,
+  lightMinStreak: 2,
+} as const;
+
+function lossSalvageShouldExit(
+  pos: LateEntryPosition,
+  gap: number | null,
+  remaining: number,
+  nowMs: number,
+): { exit: boolean; reason: string | null } {
+  const C = LOSS_SALVAGE_CFG;
+
+  const arr = pos.lossSalvageGaps;
+  if (gap !== null) {
+    arr.push({ t: nowMs, gap });
+    const cut = nowMs - C.lookbackMs;
+    while (arr.length > 0 && arr[0]!.t < cut) {
+      arr.shift();
+    }
+  }
+
+  if (gap === null) {
+    pos.lossSalvageAdverseStreak = 0;
+    return { exit: false, reason: null };
+  }
+
+  const lightAdverse =
+    (pos.side === "UP" && gap <= -C.lightUsd) ||
+    (pos.side === "DOWN" && gap >= C.lightUsd);
+
+  if (lightAdverse) {
+    pos.lossSalvageAdverseStreak += 1;
+  } else {
+    pos.lossSalvageAdverseStreak = 0;
+  }
+
+  const strongAdverseNow =
+    (pos.side === "UP" && gap <= -C.strongUsd) ||
+    (pos.side === "DOWN" && gap >= C.strongUsd);
+
+  if (remaining <= C.finalRemainingSec && strongAdverseNow) {
+    return {
+      exit: true,
+      reason: `loss-salvage strong final<=${C.finalRemainingSec}s gap=${gap.toFixed(1)} rem=${remaining}s`,
+    };
+  }
+
+  if (
+    remaining <= C.finalRemainingSec &&
+    lightAdverse &&
+    pos.lossSalvageAdverseStreak >= C.lightMinStreak
+  ) {
+    return {
+      exit: true,
+      reason: `loss-salvage light final<=${C.finalRemainingSec}s gap=${gap.toFixed(
+        1,
+      )} streak=${pos.lossSalvageAdverseStreak} rem=${remaining}s`,
+    };
+  }
+
+  if (remaining <= C.strongPhaseRemainingSec && arr.length > 0) {
+    let minG = arr[0]!.gap;
+    let maxG = arr[0]!.gap;
+    for (let i = 1; i < arr.length; i++) {
+      const g = arr[i]!.gap;
+      if (g < minG) {
+        minG = g;
+      }
+      if (g > maxG) {
+        maxG = g;
+      }
+    }
+    const strongInWindow =
+      pos.side === "UP" ? minG <= -C.strongUsd : maxG >= C.strongUsd;
+    if (strongInWindow) {
+      return {
+        exit: true,
+        reason: `loss-salvage strong-in-${Math.round(C.lookbackMs / 1000)}s-window gap=${gap.toFixed(
+          1,
+        )} min=${minG.toFixed(1)} max=${maxG.toFixed(1)} rem=${remaining}s`,
+      };
+    }
+  }
+
+  return { exit: false, reason: null };
+}
+
 function checkStopLoss(
   ctx: StrategyContext,
   state: LateEntryState,
@@ -1028,7 +1126,9 @@ function checkStopLoss(
   _releaseLock: () => void,
 ): void {
   const pos = state.position;
-  if (!pos || state.stopLossFired || state.exitInProgress) return;
+  if (!pos || state.stopLossFired || state.exitInProgress) {
+    return;
+  }
 
   const currentBid = ctx.orderBook.bestBidPrice(pos.side) ?? null;
   const bestAsk = ctx.orderBook.bestAskInfo(pos.side)?.price ?? null;
@@ -1044,147 +1144,23 @@ function checkStopLoss(
     pos.maxSeenBid = currentBid;
   }
 
-  // Promote stop to 0.92 only once bid reaches 0.97.
-  // Until then the fixed -0.20 stop holds — no trailing, no break-even.
-  if (!pos.breakEvenLocked && pos.maxSeenBid >= 0.97) {
-    pos.stopLossPrice = 0.92;
-    pos.breakEvenLocked = true;
+  const salvage = lossSalvageShouldExit(pos, gap, remaining, Date.now());
+  if (!salvage.exit) {
     ctx.log(
-      `[${ctx.slug}] late-entry: stop promoted to 0.92 (bid hit 0.95, entry=${pos.entryPrice.toFixed(2)})`,
-      "cyan",
+      `[${ctx.slug}] late-entry: pos-tick` +
+        ` ask=${bestAsk?.toFixed(2) ?? "none"}` +
+        ` bid=${currentBid?.toFixed(2) ?? "none"}` +
+        ` spread=${spread != null ? spread.toFixed(2) : "?"}` +
+        ` gap=${gap?.toFixed(1) ?? "null"}` +
+        ` rem=${remaining}s` +
+        ` LsalvStreak=${pos.lossSalvageAdverseStreak}` +
+        ` LsalvSamples=${pos.lossSalvageGaps.length}`,
+      "dim",
     );
+    return;
   }
 
-  // Velocity tracking: store current bid for use next tick, compute single-tick drop.
-  const bidDrop = pos.prevBid !== null && currentBid !== null
-    ? pos.prevBid - currentBid
-    : 0;
-  pos.prevBid = currentBid;
-
-  const gapReversed =
-    gap !== null &&
-    ((pos.side === "UP" && gap < -10) ||
-      (pos.side === "DOWN" && gap > 10));
-
-  // Softer gap threshold used only for velocity crash detection.
-  const softGapReversed =
-    gap !== null &&
-    ((pos.side === "UP" && gap < -5) ||
-      (pos.side === "DOWN" && gap > 5));
-
-  if (gapReversed) {
-    pos.gapRevTicks++;
-  } else {
-    pos.gapRevTicks = 0;
-  }
-  const gapRevStable = pos.gapRevTicks >= 3;
-
-  const gapIsLarge = gap !== null && Math.abs(gap) > 20;
-
-  const rawStopBreached =
-    currentBid !== null &&
-    currentBid <= pos.stopLossPrice;
-
-  if (rawStopBreached) {
-    pos.stopBreachTicks++;
-  } else {
-    pos.stopBreachTicks = 0;
-  }
-
-  const stopGap =
-    currentBid !== null ? pos.stopLossPrice - currentBid : 0;
-
-  const bookIsEmpty = remaining < 25 && (currentBid ?? 0) < 0.30;
-
-  // Option B: in the final 90s, if bid already hit 0.95 (breakEvenLocked) and
-  // the BTC gap is still in our direction, hold for resolution.
-  const inResolutionHold =
-    remaining < 90 &&
-    pos.breakEvenLocked &&
-    gap !== null &&
-    ((pos.side === "UP" && gap > 5) ||
-      (pos.side === "DOWN" && gap < -5));
-
-  const stopBreached =
-    !bookIsEmpty &&
-    !inResolutionHold &&
-    rawStopBreached &&
-    (
-      (gapIsLarge && gapRevStable) ||
-      (!gapIsLarge && (!gapReversed || gapRevStable))
-    );
-
-  // Gap confirmed reversed for 3 ticks AND bid is still above entry price —
-  // don't wait for the fixed stop, sell now to protect profit.
-  const panicExit =
-    gapRevStable &&
-    currentBid !== null &&
-    currentBid > pos.entryPrice &&
-    !inResolutionHold;
-
-  // Velocity crash: bid dropped hard in a single tick while gap is already turning.
-  // Fires on first detection — no need to wait for gapRevStable (3 ticks).
-  const velocityCrash =
-    bidDrop >= 0.06 &&
-    softGapReversed &&
-    pos.gapRevTicks >= 1 &&   // gap must be sustained, not a 1-tick noise spike
-    !inResolutionHold;
-
-  // Profit protection: large single-tick bid crash while still in profit.
-  // Gap hasn't reversed yet but money is at risk — get out now.
-  const profitProtectionExit =
-    bidDrop >= 0.07 &&
-    currentBid !== null &&
-    currentBid > pos.entryPrice &&
-    !inResolutionHold;
-
-
-  const nearExpiryFlip =
-    remaining < 25 &&
-    gap !== null &&
-    Math.abs(gap) <= 5 &&
-    (currentBid ?? 0) > 0.30;
-
-  const stopMode = gapIsLarge
-    ? (gapRevStable ? "gap-large-reversed" : "gap-large-protected")
-    : (!gapReversed ? "gap-small-normal" : "gap-small-reversal");
-
-  ctx.log(
-    `[${ctx.slug}] late-entry: pos-tick` +
-    ` ask=${bestAsk?.toFixed(2) ?? "none"}` +
-    ` bid=${currentBid?.toFixed(2) ?? "none"}` +
-    ` spread=${spread != null ? spread.toFixed(2) : "?"}` +
-    ` gap=${gap?.toFixed(1) ?? "null"}` +
-    ` stop=${pos.stopLossPrice.toFixed(2)}` +
-    ` stopGap=${stopGap.toFixed(2)}` +
-    ` peak=${pos.maxSeenBid.toFixed(2)}` +
-    ` entry=${pos.entryPrice.toFixed(2)}` +
-    ` beLocked=${pos.breakEvenLocked}` +
-    ` trackedShares=${pos.shares.toFixed(6)}` +
-    ` gapRev=${gapReversed}` +
-    ` gapRevTicks=${pos.gapRevTicks}` +
-    ` stopTicks=${pos.stopBreachTicks}` +
-    ` stopMode=${stopMode}` +
-    ` gapIsLarge=${gapIsLarge}` +
-    ` gapRevStable=${gapRevStable}` +
-    ` bookEmpty=${bookIsEmpty}` +
-    ` resolutionHold=${inResolutionHold}`,
-    "dim",
-  );
-
-  // const shouldSell = nearExpiryFlip || stopBreached || panicExit || velocityCrash || profitProtectionExit;
-  const shouldSell = false;
-  if (!shouldSell) return;
-
-  const exitReason = nearExpiryFlip
-    ? `near-expiry coin-flip (gap=${gap?.toFixed(1)}, remaining=${remaining}s)`
-    : panicExit
-      ? `panic-exit (gapRevStable, bid=${currentBid?.toFixed(2)}, peak=${pos.maxSeenBid.toFixed(2)}, entry=${pos.entryPrice.toFixed(2)}, gap=${gap?.toFixed(1)})`
-      : velocityCrash
-        ? `velocity-crash (bidDrop=${bidDrop.toFixed(2)}/tick, bid=${currentBid?.toFixed(2)}, gap=${gap?.toFixed(1)}, entry=${pos.entryPrice.toFixed(2)})`
-        : profitProtectionExit
-          ? `profit-protection (bidDrop=${bidDrop.toFixed(2)}/tick, bid=${currentBid?.toFixed(2)}, peak=${pos.maxSeenBid.toFixed(2)}, entry=${pos.entryPrice.toFixed(2)})`
-          : `stop-loss @ ${pos.stopLossPrice.toFixed(2)} (mode=${stopMode}, stopGap=${stopGap.toFixed(2)}, peakBid=${pos.maxSeenBid.toFixed(2)}, entry=${pos.entryPrice.toFixed(2)}, beLocked=${pos.breakEvenLocked})`;
+  const exitReason = salvage.reason ?? "loss-salvage";
 
   state.stopLossFired = true;
   state.exitInProgress = true;
@@ -1257,7 +1233,6 @@ function checkStopLoss(
 
           const remainingShares = ctx.getTrackedShares(tokenId);
           if (remainingShares > DUST_SHARES) {
-            // partial fill — retry for the remainder
             tryExit();
             return;
           }
