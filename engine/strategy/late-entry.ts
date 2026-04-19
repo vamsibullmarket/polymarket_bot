@@ -240,7 +240,7 @@ const ENTRY_STRATEGY: "v1" | "v2" = "v2";
 
 /** Only when `remaining < 25`: tight band + liquidity (see `checkEntryV2FinalStretch`). */
 const TIGHT_ENTRY_REMAINING_THRESHOLD = 35;
-const TIGHT_ENTRY_PRICE_MIN = 0.85;
+const TIGHT_ENTRY_PRICE_MIN = 0.80;
 const TIGHT_ENTRY_PRICE_MAX = 0.9;
 const TIGHT_ENTRY_MIN_LIQUIDITY = 80;
 
