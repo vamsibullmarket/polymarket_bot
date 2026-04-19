@@ -1194,6 +1194,7 @@ function checkStopLoss(
   gap: number | null,
   _rsi: number | null,
   _releaseLock: () => void,
+  peakGapRatio: number | null,
 ): void {
   const pos = state.position;
   if (!pos || state.stopLossFired || state.exitInProgress) {
@@ -1214,17 +1215,87 @@ function checkStopLoss(
     pos.maxSeenBid = currentBid;
   }
 
+  // --- Diagnostics only (display / logging). Exit decisions use `positionExitShouldTrigger` below. ---
+  if (!pos.breakEvenLocked && pos.maxSeenBid >= 0.97) {
+    pos.stopLossPrice = 0.92;
+    pos.breakEvenLocked = true;
+    ctx.log(
+      `[${ctx.slug}] late-entry: stop promoted to 0.92 (bid hit 0.97, entry=${pos.entryPrice.toFixed(2)})`,
+      "cyan",
+    );
+  }
+
+  pos.prevBid = currentBid;
+
+  const gapReversed =
+    gap !== null &&
+    ((pos.side === "UP" && gap < -10) || (pos.side === "DOWN" && gap > 10));
+
+  if (gapReversed) {
+    pos.gapRevTicks += 1;
+  } else {
+    pos.gapRevTicks = 0;
+  }
+  const gapRevStable = pos.gapRevTicks >= 3;
+
+  const gapIsLarge = gap !== null && Math.abs(gap) > 20;
+
+  const rawStopBreached =
+    currentBid !== null && currentBid <= pos.stopLossPrice;
+
+  if (rawStopBreached) {
+    pos.stopBreachTicks += 1;
+  } else {
+    pos.stopBreachTicks = 0;
+  }
+
+  const stopGap =
+    currentBid !== null ? pos.stopLossPrice - currentBid : 0;
+
+  const bookIsEmpty = remaining < 25 && (currentBid ?? 0) < 0.3;
+
+  const inResolutionHold =
+    remaining < 90 &&
+    pos.breakEvenLocked &&
+    gap !== null &&
+    ((pos.side === "UP" && gap > 5) || (pos.side === "DOWN" && gap < -5));
+
+  const stopMode = gapIsLarge
+    ? gapRevStable
+      ? "gap-large-reversed"
+      : "gap-large-protected"
+    : !gapReversed
+      ? "gap-small-normal"
+      : "gap-small-reversal";
+
   const turned = marketTurnedAgainstPosition(pos, gap);
   const exit = positionExitShouldTrigger(pos, gap, remaining, currentBid, spread);
   if (!exit.exit) {
+    const peakGapS =
+      peakGapRatio !== null ? ` peakGapRatio=${peakGapRatio.toFixed(2)}` : "";
     ctx.log(
       `[${ctx.slug}] late-entry: pos-tick` +
-      ` ask=${bestAsk?.toFixed(2) ?? "none"}` +
-      ` bid=${currentBid?.toFixed(2) ?? "none"}` +
-      ` spread=${spread != null ? spread.toFixed(2) : "?"}` +
-      ` gap=${gap?.toFixed(1) ?? "null"}` +
-      ` rem=${remaining}s` +
-      ` mktTurned=${turned}`,
+        ` ask=${bestAsk?.toFixed(2) ?? "none"}` +
+        ` bid=${currentBid?.toFixed(2) ?? "none"}` +
+        ` spread=${spread != null ? spread.toFixed(2) : "?"}` +
+        ` gap=${gap?.toFixed(1) ?? "null"}` +
+        ` rem=${remaining}s` +
+        ` mktTurned=${turned}` +
+        ` stop=${pos.stopLossPrice.toFixed(2)}` +
+        ` stopGap=${stopGap.toFixed(2)}` +
+        ` peak=${pos.maxSeenBid.toFixed(2)}` +
+        ` entry=${pos.entryPrice.toFixed(2)}` +
+        ` beLocked=${pos.breakEvenLocked}` +
+        ` trackedShares=${pos.shares.toFixed(6)}` +
+        ` gapRev=${gapReversed}` +
+        ` gapRevTicks=${pos.gapRevTicks}` +
+        ` stopTicks=${pos.stopBreachTicks}` +
+        ` stopMode=${stopMode}` +
+        ` gapIsLarge=${gapIsLarge}` +
+        ` gapRevStable=${gapRevStable}` +
+        ` bookEmpty=${bookIsEmpty}` +
+        ` resolutionHold=${inResolutionHold}` +
+        peakGapS,
       "dim",
     );
     return;
@@ -1414,7 +1485,8 @@ export const lateEntry: Strategy = async (ctx) => {
       return;
     }
 
-    // One-shot CLOB hint (no PnL): win_preview / loss_preview / uncertain — before early teardown.
+    // One-shot CLOB hint (no PnL): win_preview / loss_preview / uncertain — sampled at end of window only
+    // so mid-round exits are not scored against an immature book.
     if (!state.settlementPreviewLogged && state.hadPosition) {
       const side = state.position?.side ?? state.lastTradeSide;
       if (!side) {
@@ -1427,16 +1499,7 @@ export const lateEntry: Strategy = async (ctx) => {
         const mid = midForOutcome(ctx, side);
         const { price, source } = signalPriceForSettlement(ctx, side);
         const label = classifySettlementPreview(price);
-        const fire =
-          (remaining === 1 && state.position !== null) ||
-          (remaining <= 5 &&
-            !state.position &&
-            !state.exitInProgress &&
-            state.hadPosition) ||
-          (!state.position &&
-            !state.exitInProgress &&
-            state.hadPosition &&
-            remaining > 5);
+        const fire = remaining <= 1 && !state.exitInProgress;
         if (fire) {
           const afterProgrammaticExit = state.lastExitReason !== null;
           const exitSnap = state.lastExitReason;
@@ -1504,7 +1567,12 @@ export const lateEntry: Strategy = async (ctx) => {
       return;
     }
 
-    if (remaining <= 5 && !state.position && !state.exitInProgress) {
+    if (
+      remaining <= 5 &&
+      !state.position &&
+      !state.exitInProgress &&
+      !(state.hadPosition && !state.settlementPreviewLogged)
+    ) {
       clearInterval(tickInterval);
       if (!state.released) {
         state.released = true;
@@ -1725,7 +1793,15 @@ export const lateEntry: Strategy = async (ctx) => {
     }
 
     if (state.position && !state.stopLossFired && !state.exitInProgress) {
-      checkStopLoss(ctx, state, remaining, gap, indicators.rsi, releaseLock);
+      checkStopLoss(
+        ctx,
+        state,
+        remaining,
+        gap,
+        indicators.rsi,
+        releaseLock,
+        indicators.peakGapRatio(gap),
+      );
     }
   }, 1000);
 
