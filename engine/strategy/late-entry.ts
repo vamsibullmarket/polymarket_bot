@@ -263,7 +263,7 @@ const FINAL_STRETCH_STOP_LOSS_PRICE = 0.5;
 const EARLY_TREND_REMAINING_MIN = 151;
 const EARLY_TREND_REMAINING_MAX = 270;
 /** Reject when |gap| <= this (USD vs open). */
-const EARLY_TREND_MIN_ABS_GAP = 80;
+const EARLY_TREND_MIN_ABS_GAP = 90;
 const EARLY_TREND_PRICE_MIN = 0.75;
 const EARLY_TREND_PRICE_MAX = 0.9;
 const EARLY_TREND_MAX_DIVERGENCE = 35;
@@ -836,7 +836,7 @@ function sharesForNotional(price: number, notionalUsd = TARGET_ORDER_USD): numbe
 }
 
 /**
- * V2 entry for 151–270s remaining: |gap| > 80, ask in [0.75, 0.90], divergence cap 35.
+ * V2 entry for 151–270s remaining: |gap| > 90, ask in [0.75, 0.90], divergence cap 35.
  * Programmatic exit still uses `bidFloorUsd` 0.25 + market-turn (`positionExitShouldTrigger`).
  */
 function checkEntryV2EarlyTrend(params: {
