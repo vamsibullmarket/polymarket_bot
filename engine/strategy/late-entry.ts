@@ -1,5 +1,6 @@
 // Buy and Hold strategy
 
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import type { Strategy, StrategyContext } from "./types.ts";
 import { Env } from "../../utils/config.ts";
 import { getSlug } from "../../utils/slot.ts";
@@ -237,9 +238,64 @@ const OPEN_PRICE_HARD_TIMEOUT_S = 90;
 
 const ENTRY_STRATEGY: "v1" | "v2" = "v2";
 
+/** Only when `remaining < 25`: tight band + liquidity (see `checkEntryV2FinalStretch`). */
+const TIGHT_ENTRY_REMAINING_THRESHOLD = 25;
+const TIGHT_ENTRY_PRICE_MIN = 0.85;
+const TIGHT_ENTRY_PRICE_MAX = 0.9;
+const TIGHT_ENTRY_MIN_LIQUIDITY = 80;
+
 /** CLOB mid on your outcome token — tune if most rows are uncertain. */
 const SETTLEMENT_PREVIEW_WIN_MIN = 0.98;
 const SETTLEMENT_PREVIEW_LOSS_MAX = 0.02;
+
+const WINS_AND_LOSSES_PATH = "state/winsAndLosses.txt";
+
+function readWinsAndLosses(): { wins: number; losses: number } {
+  let wins = 0;
+  let losses = 0;
+  if (!existsSync(WINS_AND_LOSSES_PATH)) {
+    return { wins, losses };
+  }
+  try {
+    const raw = readFileSync(WINS_AND_LOSSES_PATH, "utf8");
+    for (const line of raw.split("\n")) {
+      const winM = line.match(/^\s*Wins:\s*(\d+)\s*$/i);
+      const lossM = line.match(/^\s*Losses:\s*(\d+)\s*$/i);
+      if (winM) {
+        wins = parseInt(winM[1]!, 10);
+      }
+      if (lossM) {
+        losses = parseInt(lossM[1]!, 10);
+      }
+    }
+  } catch {
+    // keep zeros on read error
+  }
+  return { wins, losses };
+}
+
+function writeWinsAndLosses(wins: number, losses: number): void {
+  mkdirSync("state", { recursive: true });
+  writeFileSync(
+    WINS_AND_LOSSES_PATH,
+    `Wins: ${wins}\nLosses: ${losses}\n`,
+    "utf8",
+  );
+}
+
+/** Bump wins/losses file when settlement-preview is logged; only win_preview / loss_preview increment. */
+function recordSettlementPreviewOutcome(
+  label: "win_preview" | "loss_preview" | "uncertain" | "no_book",
+): { wins: number; losses: number } {
+  const cur = readWinsAndLosses();
+  if (label === "win_preview") {
+    cur.wins += 1;
+  } else if (label === "loss_preview") {
+    cur.losses += 1;
+  }
+  writeWinsAndLosses(cur.wins, cur.losses);
+  return cur;
+}
 
 function midForOutcome(
   ctx: StrategyContext,
@@ -307,7 +363,13 @@ function explainNoSignal(params: {
   if (params.down !== null) values.push(`down=${params.down.price.toFixed(2)}@${params.down.liquidity.toFixed(0)}`);
   else reasons.push("down_book_missing");
 
+  const isV2FinalStretch =
+    ENTRY_STRATEGY === "v2" &&
+    params.remaining >= 1 &&
+    params.remaining < TIGHT_ENTRY_REMAINING_THRESHOLD;
+
   if (params.rsi !== null) values.push(`rsi=${params.rsi.toFixed(2)}`);
+  else if (isV2FinalStretch) values.push("rsi=na");
   else reasons.push("rsi_not_ready");
 
   if (params.atr !== null) values.push(`atr=${params.atr.toFixed(2)}`);
@@ -317,12 +379,14 @@ function explainNoSignal(params: {
   else reasons.push("rtv_not_ready");
 
   if (params.gapSafety !== null) values.push(`gapSafety=${params.gapSafety.toFixed(2)}`);
+  else if (isV2FinalStretch) values.push("gapSafety=na");
   else reasons.push("gap_safety_unavailable");
 
   if (params.divergence !== null) values.push(`divergence=${params.divergence.toFixed(2)}`);
   else reasons.push("coinbase_divergence_unavailable");
 
   if (params.peakGapRatio !== null) values.push(`peakGapRatio=${params.peakGapRatio.toFixed(2)}`);
+  else if (isV2FinalStretch) values.push("peakGapRatio=na");
   else reasons.push("peak_gap_ratio_unavailable");
 
   if (params.remaining >= 5 && params.priceToBeat !== null && params.btcPrice !== undefined) {
@@ -331,8 +395,74 @@ function explainNoSignal(params: {
 
     if (params.remaining > 150) {
       reasons.push(`entry_in=${params.remaining - 150}s`);
-    } else if (params.remaining < 25) {
+    } else if (params.remaining < 1) {
       reasons.push(`too_late(remaining=${params.remaining}s)`);
+    } else if (isV2FinalStretch) {
+      // Mirror checkEntryV2FinalStretch (remaining 1..24)
+      if (params.atr === null) reasons.push("atr_not_ready");
+      else if (params.atr > 22) reasons.push(`atr_too_high=${params.atr.toFixed(2)}`);
+
+      if (params.divergence !== null && params.divergence > 18) {
+        reasons.push(`divergence_too_high=${params.divergence.toFixed(2)}`);
+      }
+
+      const inTightBand = (p: { price: number; liquidity: number } | null) =>
+        p !== null &&
+        p.price >= TIGHT_ENTRY_PRICE_MIN &&
+        p.price <= TIGHT_ENTRY_PRICE_MAX &&
+        p.liquidity >= TIGHT_ENTRY_MIN_LIQUIDITY;
+
+      const upOk = inTightBand(params.up);
+      const downOk = inTightBand(params.down);
+
+      if (!upOk && !downOk) {
+        reasons.push(
+          `final_stretch_no_tight_side(need_${TIGHT_ENTRY_PRICE_MIN}-${TIGHT_ENTRY_PRICE_MAX}@liq>=${TIGHT_ENTRY_MIN_LIQUIDITY})`,
+        );
+      } else {
+        let side: "UP" | "DOWN";
+        let info: { price: number; liquidity: number };
+        if (upOk && downOk) {
+          if (gap > 8) {
+            side = "UP";
+            info = params.up!;
+          } else if (gap < -8) {
+            side = "DOWN";
+            info = params.down!;
+          } else {
+            const upScore = params.up!.price * params.up!.liquidity;
+            const downScore = params.down!.price * params.down!.liquidity;
+            side = upScore >= downScore ? "UP" : "DOWN";
+            info = side === "UP" ? params.up! : params.down!;
+          }
+        } else if (upOk) {
+          side = "UP";
+          info = params.up!;
+        } else {
+          side = "DOWN";
+          info = params.down!;
+        }
+
+        if (side === "UP" && gap < -8) {
+          reasons.push(`gap_contradicts_up(gap=${gap.toFixed(0)})`);
+        }
+        if (side === "DOWN" && gap > 8) {
+          reasons.push(`gap_contradicts_down(gap=${gap.toFixed(0)})`);
+        }
+
+        if (params.rsi !== null) {
+          if (side === "UP" && params.rsi < 30) {
+            reasons.push(`final_stretch_rsi_contradicts_up(rsi=${params.rsi.toFixed(1)})`);
+          }
+          if (side === "DOWN" && params.rsi > 70) {
+            reasons.push(`final_stretch_rsi_contradicts_down(rsi=${params.rsi.toFixed(1)})`);
+          }
+        }
+
+        if (params.atr !== null && params.atr < 0.05) {
+          reasons.push(`atr_frozen_low=${params.atr.toFixed(2)}`);
+        }
+      }
     } else if (ENTRY_STRATEGY === "v1") {
       // V1 conditions
       if (params.atr === null) reasons.push("atr_not_ready");
@@ -347,8 +477,7 @@ function explainNoSignal(params: {
       if (upStrong && gap < -20) reasons.push(`gap_contradicts_up(gap=${gap.toFixed(0)})`);
       if (downStrong && !upStrong && gap > 20) reasons.push(`gap_contradicts_down(gap=${gap.toFixed(0)})`);
     } else {
-      // V2 conditions
-      // V2 conditions
+      // V2 normal window (remaining >= 25)
       if (params.atr === null) reasons.push("atr_not_ready");
       else if (params.atr > 22) reasons.push(`atr_too_high=${params.atr.toFixed(2)}`);
 
@@ -366,16 +495,25 @@ function explainNoSignal(params: {
           let side: "UP" | "DOWN";
           let info: { price: number; liquidity: number };
           if (upStrong && downStrong) {
-            if (gap > 8) { side = "UP"; info = params.up!; }
-            else if (gap < -8) { side = "DOWN"; info = params.down!; }
-            else {
+            if (gap > 8) {
+              side = "UP";
+              info = params.up!;
+            } else if (gap < -8) {
+              side = "DOWN";
+              info = params.down!;
+            } else {
               const upScore = params.up!.price * params.up!.liquidity;
               const downScore = params.down!.price * params.down!.liquidity;
               side = upScore >= downScore ? "UP" : "DOWN";
               info = side === "UP" ? params.up! : params.down!;
             }
-          } else if (upStrong) { side = "UP"; info = params.up!; }
-          else { side = "DOWN"; info = params.down!; }
+          } else if (upStrong) {
+            side = "UP";
+            info = params.up!;
+          } else {
+            side = "DOWN";
+            info = params.down!;
+          }
 
           if (Math.abs(gap) < 25) reasons.push(`gap_too_small(${gap.toFixed(1)})`);
           if (info.liquidity < 120) reasons.push(`liq_too_low=${info.liquidity.toFixed(0)}`);
@@ -384,10 +522,14 @@ function explainNoSignal(params: {
           if (side === "UP" && gap < -8) reasons.push(`gap_contradicts_up(gap=${gap.toFixed(0)})`);
           if (side === "DOWN" && gap > 8) reasons.push(`gap_contradicts_down(gap=${gap.toFixed(0)})`);
           if (info.price < 0.55) reasons.push(`price_too_low=${info.price.toFixed(2)}`);
-          if (info.price > 0.90) reasons.push(`price_too_high=${info.price.toFixed(2)}`);
+          if (info.price > 0.9) reasons.push(`price_too_high=${info.price.toFixed(2)}`);
           if (info.liquidity < 80) reasons.push(`liq_too_low=${info.liquidity.toFixed(0)}`);
-          if (params.peakGapRatio !== null && params.peakGapRatio < 0.55) reasons.push(`peak_gap_ratio_low=${params.peakGapRatio.toFixed(2)}`);
-          if (params.gapSafety !== null && params.gapSafety < 8) reasons.push(`gap_safety_low=${params.gapSafety.toFixed(2)}`);
+          if (params.peakGapRatio !== null && params.peakGapRatio < 0.55) {
+            reasons.push(`peak_gap_ratio_low=${params.peakGapRatio.toFixed(2)}`);
+          }
+          if (params.gapSafety !== null && params.gapSafety < 8) {
+            reasons.push(`gap_safety_low=${params.gapSafety.toFixed(2)}`);
+          }
         }
       }
     }
@@ -402,22 +544,111 @@ function sharesForNotional(price: number, notionalUsd = TARGET_ORDER_USD): numbe
 }
 
 /**
- * Strategy V2 entry: same base gates as V1 but adds:
- *  - RSI on gap must confirm direction (gap momentum alignment)
- *  - Tighter gap/direction sanity (-8/+8 vs -20/+20)
- *  - When both sides are strong, gap direction wins the tiebreaker first;
- *    price*liquidity score is only a secondary tiebreaker when gap is near zero
- *  - Entry price ceiling: avoid paying > 0.82 (market already priced in the move)
- *  - Entry price floor: avoid paying < 0.58 (too uncertain, wide stop needed)
+ * Last ~24s of the entry window (`remaining` in 1..24): high CLOB price on one side only.
+ * Does not use min-|gap|, peak-gap, or gapSafety — those stay on the normal `checkEntryV2` path.
  */
+function checkEntryV2FinalStretch(params: {
+  remaining: number;
+  btcPrice: number;
+  priceToBeat: number;
+  up: { price: number; liquidity: number } | null;
+  down: { price: number; liquidity: number } | null;
+  rsi: number | null;
+  atr: number | null;
+  rtv: number | null;
+  gapSafety: number | null;
+  divergence: number | null;
+  peakGapRatio: number | null;
+}): EntrySignal | null {
+  const { btcPrice, priceToBeat, up, down, atr, divergence, rsi } = params;
+
+  if (atr === null || atr > 22) {
+    return null;
+  }
+
+  const div = divergence ?? Infinity;
+  if (div > 18) {
+    return null;
+  }
+
+  const gap = btcPrice - priceToBeat;
+
+  const inTightBand = (p: { price: number; liquidity: number } | null) =>
+    p !== null &&
+    p.price >= TIGHT_ENTRY_PRICE_MIN &&
+    p.price <= TIGHT_ENTRY_PRICE_MAX &&
+    p.liquidity >= TIGHT_ENTRY_MIN_LIQUIDITY;
+
+  const upOk = inTightBand(up);
+  const downOk = inTightBand(down);
+
+  if (!upOk && !downOk) {
+    return null;
+  }
+
+  let side: "UP" | "DOWN";
+  let info: { price: number; liquidity: number };
+
+  if (upOk && downOk) {
+    if (gap > 8) {
+      side = "UP";
+      info = up!;
+    } else if (gap < -8) {
+      side = "DOWN";
+      info = down!;
+    } else {
+      const upScore = up!.price * up!.liquidity;
+      const downScore = down!.price * down!.liquidity;
+      side = upScore >= downScore ? "UP" : "DOWN";
+      info = side === "UP" ? up! : down!;
+    }
+  } else if (upOk) {
+    side = "UP";
+    info = up!;
+  } else {
+    side = "DOWN";
+    info = down!;
+  }
+
+  if (side === "UP" && gap < -8) {
+    return null;
+  }
+  if (side === "DOWN" && gap > 8) {
+    return null;
+  }
+
+  if (rsi !== null) {
+    if (side === "UP" && rsi < 30) {
+      return null;
+    }
+    if (side === "DOWN" && rsi > 70) {
+      return null;
+    }
+  }
+
+  if (atr !== null && atr < 0.05) {
+    return null;
+  }
+
+  const stopLossPrice = Math.max(0.5, info.price - 0.2);
+
+  return {
+    side,
+    ask: info.price,
+    gap: Math.abs(gap),
+    liquidity: info.liquidity,
+    stopLossPrice,
+  };
+}
+
 /**
  * Strategy V2 entry: same base gates as V1 but adds:
  *  - RSI on gap must confirm direction (gap momentum alignment)
  *  - Tighter gap/direction sanity (-8/+8 vs -20/+20)
  *  - When both sides are strong, gap direction wins the tiebreaker first;
  *    price*liquidity score is only a secondary tiebreaker when gap is near zero
- *  - Entry price band: 0.74–0.77 (strong conviction zone with meaningful upside)
- *  - Stop at entry - 0.20; only promotes to 0.92 once bid hits 0.95
+ *  - Entry price band (normal window): 0.74–0.90 per existing filters
+ *  - When `remaining < 25` (and >= 1): see `checkEntryV2FinalStretch` (0.85–0.90 tight band)
  */
 function checkEntryV2(params: {
   remaining: number;
@@ -434,34 +665,58 @@ function checkEntryV2(params: {
 }): EntrySignal | null {
   const { remaining, btcPrice, priceToBeat, up, down, atr, divergence, rsi } = params;
 
-  // --- Time window: 150 seconds remaining ---
-  if (remaining < 25 || remaining > 150) return null;
+  if (remaining < 1 || remaining > 150) {
+    return null;
+  }
+
+  if (remaining < TIGHT_ENTRY_REMAINING_THRESHOLD) {
+    return checkEntryV2FinalStretch(params);
+  }
+
+  // --- Time window: 150 seconds remaining (unchanged: 25..150) ---
+  if (remaining < 25 || remaining > 150) {
+    return null;
+  }
 
   // --- Volatility gate ---
-  if (atr === null || atr > 22) return null;
+  if (atr === null || atr > 22) {
+    return null;
+  }
 
   // --- Exchange divergence gate ---
   const div = divergence ?? Infinity;
-  if (div > 18) return null;
+  if (div > 18) {
+    return null;
+  }
 
   // --- RSI must be ready ---
-  if (rsi === null) return null;
+  if (rsi === null) {
+    return null;
+  }
 
   const gap = btcPrice - priceToBeat;
 
   // --- CLOB conviction ---
   const upStrong = up !== null && up.price >= 0.55 && up.liquidity >= 60;
   const downStrong = down !== null && down.price >= 0.55 && down.liquidity >= 60;
-  if (!upStrong && !downStrong) return null;
+  if (!upStrong && !downStrong) {
+    return null;
+  }
 
   // --- Minimum absolute gap ---
-  if (Math.abs(gap) < 25) return null;
+  if (Math.abs(gap) < 25) {
+    return null;
+  }
 
   // --- Gap safety: |gap| / ATR must be meaningful ---
-  if (params.gapSafety !== null && params.gapSafety < 8) return null;
+  if (params.gapSafety !== null && params.gapSafety < 8) {
+    return null;
+  }
 
   // --- Peak gap ratio: gap must still be near its peak ---
-  if (params.peakGapRatio !== null && params.peakGapRatio < 0.55) return null;
+  if (params.peakGapRatio !== null && params.peakGapRatio < 0.55) {
+    return null;
+  }
 
   // --- Determine side with gap direction as primary tiebreaker ---
   let side: "UP" | "DOWN";
@@ -489,24 +744,38 @@ function checkEntryV2(params: {
   }
 
   // --- Directional side needs stronger liquidity than the baseline $80 floor ---
-  if (info.liquidity < 80) return null;
+  if (info.liquidity < 80) {
+    return null;
+  }
 
   // --- RSI momentum must agree with chosen side ---
-  if (side === "UP" && rsi < 35) return null;
-  if (side === "DOWN" && rsi > 65) return null;
+  if (side === "UP" && rsi < 35) {
+    return null;
+  }
+  if (side === "DOWN" && rsi > 65) {
+    return null;
+  }
 
   // --- Gap/direction sanity ---
-  if (side === "UP" && gap < -8) return null;
-  if (side === "DOWN" && gap > 8) return null;
+  if (side === "UP" && gap < -8) {
+    return null;
+  }
+  if (side === "DOWN" && gap > 8) {
+    return null;
+  }
 
   // --- Price band: 0.74–0.77 only ---
   // Strong conviction zone: meaningful upside to 1.00, -0.20 stop stays above 0.50
-  if (info.price < 0.74 || info.price > 0.90) return null;
+  if (info.price < 0.74 || info.price > 0.9) {
+    return null;
+  }
 
-  if (atr !== null && atr < 0.05) return null;
+  if (atr !== null && atr < 0.05) {
+    return null;
+  }
 
   // Stop is fixed at entry - 0.20; floor at 0.50 as hard minimum
-  const stopLossPrice = Math.max(0.50, info.price - 0.20);
+  const stopLossPrice = Math.max(0.5, info.price - 0.2);
 
   return {
     side,
@@ -1014,6 +1283,7 @@ export const lateEntry: Strategy = async (ctx) => {
             state.hadPosition &&
             remaining > 5);
         if (fire) {
+          const totals = recordSettlementPreviewOutcome(label);
           const color =
             label === "win_preview"
               ? "green"
@@ -1023,7 +1293,7 @@ export const lateEntry: Strategy = async (ctx) => {
                   ? "yellow"
                   : "dim";
           ctx.log(
-            `[${ctx.slug}] late-entry: settlement-preview side=${side} mid=${mid?.toFixed(4) ?? "n/a"} label=${label} (mid>=${SETTLEMENT_PREVIEW_WIN_MIN} win, mid<=${SETTLEMENT_PREVIEW_LOSS_MAX} loss)`,
+            `[${ctx.slug}] late-entry: settlement-preview side=${side} mid=${mid?.toFixed(4) ?? "n/a"} label=${label} preview_wins=${totals.wins} preview_losses=${totals.losses} (mid>=${SETTLEMENT_PREVIEW_WIN_MIN} win, mid<=${SETTLEMENT_PREVIEW_LOSS_MAX} loss)`,
             color,
           );
           state.settlementPreviewLogged = true;
@@ -1153,31 +1423,31 @@ export const lateEntry: Strategy = async (ctx) => {
       const signal =
         ENTRY_STRATEGY === "v2"
           ? checkEntryV2({
-              remaining,
-              btcPrice: liveBtcPrice,
-              priceToBeat,
-              up,
-              down,
-              rsi: indicators.rsi,
-              atr: indicators.atr,
-              rtv: indicators.rtv,
-              gapSafety: indicators.gapSafety(gap),
-              divergence: ctx.ticker.divergence,
-              peakGapRatio: indicators.peakGapRatio(gap),
-            })
+            remaining,
+            btcPrice: liveBtcPrice,
+            priceToBeat,
+            up,
+            down,
+            rsi: indicators.rsi,
+            atr: indicators.atr,
+            rtv: indicators.rtv,
+            gapSafety: indicators.gapSafety(gap),
+            divergence: ctx.ticker.divergence,
+            peakGapRatio: indicators.peakGapRatio(gap),
+          })
           : checkEntry({
-              remaining,
-              btcPrice: liveBtcPrice,
-              priceToBeat,
-              up,
-              down,
-              rsi: indicators.rsi,
-              atr: indicators.atr,
-              rtv: indicators.rtv,
-              gapSafety: indicators.gapSafety(gap),
-              divergence: ctx.ticker.divergence,
-              peakGapRatio: indicators.peakGapRatio(gap),
-            });
+            remaining,
+            btcPrice: liveBtcPrice,
+            priceToBeat,
+            up,
+            down,
+            rsi: indicators.rsi,
+            atr: indicators.atr,
+            rtv: indicators.rtv,
+            gapSafety: indicators.gapSafety(gap),
+            divergence: ctx.ticker.divergence,
+            peakGapRatio: indicators.peakGapRatio(gap),
+          });
 
       if (signal) {
         // Spread gate: wide spread = thin book = high slippage risk, skip.
