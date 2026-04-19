@@ -209,9 +209,6 @@ type LateEntryPosition = {
   breakEvenLocked: boolean;
   gapRevTicks: number;
   stopBreachTicks: number;
-  // On LateEntryPosition type:
-  lossSalvageGaps: Array<{ t: number; gap: number }>;
-  lossSalvageAdverseStreak: number;
 };
 
 type LateEntryState = {
@@ -994,9 +991,6 @@ function placeEntry(
           breakEvenLocked: false,
           gapRevTicks: 0,
           stopBreachTicks: 0,
-          // In onFilled, inside state.position = { ... }
-          lossSalvageGaps: [],
-          lossSalvageAdverseStreak: 0,
         };
         state.lastTradeSide = signal.side;
         state.stopLossFired = false;
@@ -1025,93 +1019,61 @@ function placeEntry(
   ]);
 }
 
-const LOSS_SALVAGE_CFG = {
-  lightUsd: 10,
-  strongUsd: 30,
-  lookbackMs: 60_000,
-  finalRemainingSec: 30,
-  strongPhaseRemainingSec: 60,
-  lightMinStreak: 2,
+const POSITION_EXIT_CFG = {
+  /** Fire when best bid is at or below this (dollars per share). */
+  bidFloorUsd: 0.25,
+  /**
+   * BTC vs strike must favor the *other* side by at least this many dollars
+   * before the bid-floor exit is allowed (UP: gap <= -marketTurnGapUsd).
+   */
+  marketTurnGapUsd: 10,
+  /** Last-minute weak-book exit: remaining seconds in the window. */
+  lastMinuteRemainingSec: 60,
+  /** Ask−bid must be at least this large in the last minute to count as “wide”. */
+  lateSpreadMin: 0.04,
+  /** With wide spread in the last minute, exit if bid is strictly below this. */
+  lateWeakBidMax: 0.35,
 } as const;
 
-function lossSalvageShouldExit(
+function marketTurnedAgainstPosition(pos: LateEntryPosition, gap: number | null): boolean {
+  if (gap === null) {
+    return false;
+  }
+  const t = POSITION_EXIT_CFG.marketTurnGapUsd;
+  if (pos.side === "UP") {
+    return gap <= -t;
+  }
+  return gap >= t;
+}
+
+function positionExitShouldTrigger(
   pos: LateEntryPosition,
   gap: number | null,
   remaining: number,
-  nowMs: number,
+  currentBid: number | null,
+  spread: number | null,
 ): { exit: boolean; reason: string | null } {
-  const C = LOSS_SALVAGE_CFG;
+  const C = POSITION_EXIT_CFG;
+  const turned = marketTurnedAgainstPosition(pos, gap);
 
-  const arr = pos.lossSalvageGaps;
-  if (gap !== null) {
-    arr.push({ t: nowMs, gap });
-    const cut = nowMs - C.lookbackMs;
-    while (arr.length > 0 && arr[0]!.t < cut) {
-      arr.shift();
-    }
-  }
-
-  if (gap === null) {
-    pos.lossSalvageAdverseStreak = 0;
-    return { exit: false, reason: null };
-  }
-
-  const lightAdverse =
-    (pos.side === "UP" && gap <= -C.lightUsd) ||
-    (pos.side === "DOWN" && gap >= C.lightUsd);
-
-  if (lightAdverse) {
-    pos.lossSalvageAdverseStreak += 1;
-  } else {
-    pos.lossSalvageAdverseStreak = 0;
-  }
-
-  const strongAdverseNow =
-    (pos.side === "UP" && gap <= -C.strongUsd) ||
-    (pos.side === "DOWN" && gap >= C.strongUsd);
-
-  if (remaining <= C.finalRemainingSec && strongAdverseNow) {
+  if (currentBid !== null && currentBid <= C.bidFloorUsd && turned) {
     return {
       exit: true,
-      reason: `loss-salvage strong final<=${C.finalRemainingSec}s gap=${gap.toFixed(1)} rem=${remaining}s`,
+      reason: `exit bid<=${C.bidFloorUsd} + market-turned gap=${gap?.toFixed(1) ?? "na"} side=${pos.side}`,
     };
   }
 
   if (
-    remaining <= C.finalRemainingSec &&
-    lightAdverse &&
-    pos.lossSalvageAdverseStreak >= C.lightMinStreak
+    remaining <= C.lastMinuteRemainingSec &&
+    spread !== null &&
+    spread >= C.lateSpreadMin &&
+    currentBid !== null &&
+    currentBid < C.lateWeakBidMax
   ) {
     return {
       exit: true,
-      reason: `loss-salvage light final<=${C.finalRemainingSec}s gap=${gap.toFixed(
-        1,
-      )} streak=${pos.lossSalvageAdverseStreak} rem=${remaining}s`,
+      reason: `exit last-min wide-spread spread=${spread.toFixed(2)}>=${C.lateSpreadMin} bid=${currentBid.toFixed(2)}<${C.lateWeakBidMax} rem=${remaining}s`,
     };
-  }
-
-  if (remaining <= C.strongPhaseRemainingSec && arr.length > 0) {
-    let minG = arr[0]!.gap;
-    let maxG = arr[0]!.gap;
-    for (let i = 1; i < arr.length; i++) {
-      const g = arr[i]!.gap;
-      if (g < minG) {
-        minG = g;
-      }
-      if (g > maxG) {
-        maxG = g;
-      }
-    }
-    const strongInWindow =
-      pos.side === "UP" ? minG <= -C.strongUsd : maxG >= C.strongUsd;
-    if (strongInWindow) {
-      return {
-        exit: true,
-        reason: `loss-salvage strong-in-${Math.round(C.lookbackMs / 1000)}s-window gap=${gap.toFixed(
-          1,
-        )} min=${minG.toFixed(1)} max=${maxG.toFixed(1)} rem=${remaining}s`,
-      };
-    }
   }
 
   return { exit: false, reason: null };
@@ -1144,23 +1106,23 @@ function checkStopLoss(
     pos.maxSeenBid = currentBid;
   }
 
-  const salvage = lossSalvageShouldExit(pos, gap, remaining, Date.now());
-  if (!salvage.exit) {
+  const turned = marketTurnedAgainstPosition(pos, gap);
+  const exit = positionExitShouldTrigger(pos, gap, remaining, currentBid, spread);
+  if (!exit.exit) {
     ctx.log(
       `[${ctx.slug}] late-entry: pos-tick` +
-        ` ask=${bestAsk?.toFixed(2) ?? "none"}` +
-        ` bid=${currentBid?.toFixed(2) ?? "none"}` +
-        ` spread=${spread != null ? spread.toFixed(2) : "?"}` +
-        ` gap=${gap?.toFixed(1) ?? "null"}` +
-        ` rem=${remaining}s` +
-        ` LsalvStreak=${pos.lossSalvageAdverseStreak}` +
-        ` LsalvSamples=${pos.lossSalvageGaps.length}`,
+      ` ask=${bestAsk?.toFixed(2) ?? "none"}` +
+      ` bid=${currentBid?.toFixed(2) ?? "none"}` +
+      ` spread=${spread != null ? spread.toFixed(2) : "?"}` +
+      ` gap=${gap?.toFixed(1) ?? "null"}` +
+      ` rem=${remaining}s` +
+      ` mktTurned=${turned}`,
       "dim",
     );
     return;
   }
 
-  const exitReason = salvage.reason ?? "loss-salvage";
+  const exitReason = exit.reason ?? "position-exit";
 
   state.stopLossFired = true;
   state.exitInProgress = true;
