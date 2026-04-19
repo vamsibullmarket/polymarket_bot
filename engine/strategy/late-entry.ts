@@ -216,8 +216,12 @@ type LateEntryState = {
   stopLossFired: boolean;
   exitInProgress: boolean;
   hadPosition: boolean;
+  /** Set on BUY fill; used for settlement-preview after exit. */
+  lastTradeSide: "UP" | "DOWN" | null;
+  /** One-shot CLOB hint before official resolution. */
+  settlementPreviewLogged: boolean;
   released: boolean;
-  signalConfirmTicks: number;  // consecutive ticks with same signal — must hit 2 before entering
+  signalConfirmTicks: number; // consecutive ticks with same signal — must hit 2 before entering
 };
 
 // ---------------------------------------------------------------------------
@@ -233,6 +237,36 @@ const OPEN_PRICE_HARD_TIMEOUT_S = 90;
 
 const ENTRY_STRATEGY: "v1" | "v2" = "v2";
 
+/** CLOB mid on your outcome token — tune if most rows are uncertain. */
+const SETTLEMENT_PREVIEW_WIN_MIN = 0.98;
+const SETTLEMENT_PREVIEW_LOSS_MAX = 0.02;
+
+function midForOutcome(
+  ctx: StrategyContext,
+  side: "UP" | "DOWN",
+): number | null {
+  const bid = ctx.orderBook.bestBidPrice(side);
+  const ask = ctx.orderBook.bestAskInfo(side)?.price ?? null;
+  if (bid != null && ask != null) {
+    return (bid + ask) / 2;
+  }
+  return ask ?? bid ?? null;
+}
+
+function classifySettlementPreview(
+  mid: number | null,
+): "win_preview" | "loss_preview" | "uncertain" | "no_book" {
+  if (mid === null || Number.isNaN(mid)) {
+    return "no_book";
+  }
+  if (mid >= SETTLEMENT_PREVIEW_WIN_MIN) {
+    return "win_preview";
+  }
+  if (mid <= SETTLEMENT_PREVIEW_LOSS_MAX) {
+    return "loss_preview";
+  }
+  return "uncertain";
+}
 
 function explainNoSignal(params: {
   remaining: number;
@@ -297,7 +331,7 @@ function explainNoSignal(params: {
 
     if (params.remaining > 150) {
       reasons.push(`entry_in=${params.remaining - 150}s`);
-    } else if (params.remaining < 35) {
+    } else if (params.remaining < 25) {
       reasons.push(`too_late(remaining=${params.remaining}s)`);
     } else if (ENTRY_STRATEGY === "v1") {
       // V1 conditions
@@ -401,7 +435,7 @@ function checkEntryV2(params: {
   const { remaining, btcPrice, priceToBeat, up, down, atr, divergence, rsi } = params;
 
   // --- Time window: 150 seconds remaining ---
-  if (remaining < 35 || remaining > 150) return null;
+  if (remaining < 25 || remaining > 150) return null;
 
   // --- Volatility gate ---
   if (atr === null || atr > 22) return null;
@@ -506,7 +540,7 @@ function checkEntry(params: {
     divergence,
   } = params;
 
-  if (remaining < 35 || remaining > 150) {
+  if (remaining < 25 || remaining > 150) {
     return null;
   }
 
@@ -602,6 +636,7 @@ function placeEntry(
           gapRevTicks: 0,
           stopBreachTicks: 0,
         };
+        state.lastTradeSide = signal.side;
         state.stopLossFired = false;
         state.exitInProgress = false;
 
@@ -940,6 +975,8 @@ export const lateEntry: Strategy = async (ctx) => {
     stopLossFired: false,
     exitInProgress: false,
     hadPosition: false,
+    lastTradeSide: null,
+    settlementPreviewLogged: false,
     released: false,
     signalConfirmTicks: 0,
   };
@@ -958,6 +995,40 @@ export const lateEntry: Strategy = async (ctx) => {
         releaseLock();
       }
       return;
+    }
+
+    // One-shot CLOB hint (no PnL): win_preview / loss_preview / uncertain — before early teardown.
+    if (!state.settlementPreviewLogged && state.hadPosition) {
+      const side = state.position?.side ?? state.lastTradeSide;
+      if (side) {
+        const mid = midForOutcome(ctx, side);
+        const label = classifySettlementPreview(mid);
+        const fire =
+          (remaining === 1 && state.position !== null) ||
+          (remaining <= 5 &&
+            !state.position &&
+            !state.exitInProgress &&
+            state.hadPosition) ||
+          (!state.position &&
+            !state.exitInProgress &&
+            state.hadPosition &&
+            remaining > 5);
+        if (fire) {
+          const color =
+            label === "win_preview"
+              ? "green"
+              : label === "loss_preview"
+                ? "red"
+                : label === "no_book"
+                  ? "yellow"
+                  : "dim";
+          ctx.log(
+            `[${ctx.slug}] late-entry: settlement-preview side=${side} mid=${mid?.toFixed(4) ?? "n/a"} label=${label} (mid>=${SETTLEMENT_PREVIEW_WIN_MIN} win, mid<=${SETTLEMENT_PREVIEW_LOSS_MAX} loss)`,
+            color,
+          );
+          state.settlementPreviewLogged = true;
+        }
+      }
     }
 
     // Single-trade mode: stop only after we actually had a live position
@@ -1076,38 +1147,37 @@ export const lateEntry: Strategy = async (ctx) => {
     const gap = liveBtcPrice - priceToBeat;
     indicators.tick(gap, liveBtcPrice);
 
-    const canEnter =
-      !state.hasEntered &&
-      !state.exitInProgress;
+    const canEnter = !state.hasEntered && !state.exitInProgress;
 
     if (canEnter) {
-      const signal = ENTRY_STRATEGY === "v2"
-        ? checkEntryV2({
-          remaining,
-          btcPrice: liveBtcPrice,
-          priceToBeat,
-          up,
-          down,
-          rsi: indicators.rsi,
-          atr: indicators.atr,
-          rtv: indicators.rtv,
-          gapSafety: indicators.gapSafety(gap),
-          divergence: ctx.ticker.divergence,
-          peakGapRatio: indicators.peakGapRatio(gap),
-        })
-        : checkEntry({
-          remaining,
-          btcPrice: liveBtcPrice,
-          priceToBeat,
-          up,
-          down,
-          rsi: indicators.rsi,
-          atr: indicators.atr,
-          rtv: indicators.rtv,
-          gapSafety: indicators.gapSafety(gap),
-          divergence: ctx.ticker.divergence,
-          peakGapRatio: indicators.peakGapRatio(gap),
-        });
+      const signal =
+        ENTRY_STRATEGY === "v2"
+          ? checkEntryV2({
+              remaining,
+              btcPrice: liveBtcPrice,
+              priceToBeat,
+              up,
+              down,
+              rsi: indicators.rsi,
+              atr: indicators.atr,
+              rtv: indicators.rtv,
+              gapSafety: indicators.gapSafety(gap),
+              divergence: ctx.ticker.divergence,
+              peakGapRatio: indicators.peakGapRatio(gap),
+            })
+          : checkEntry({
+              remaining,
+              btcPrice: liveBtcPrice,
+              priceToBeat,
+              up,
+              down,
+              rsi: indicators.rsi,
+              atr: indicators.atr,
+              rtv: indicators.rtv,
+              gapSafety: indicators.gapSafety(gap),
+              divergence: ctx.ticker.divergence,
+              peakGapRatio: indicators.peakGapRatio(gap),
+            });
 
       if (signal) {
         // Spread gate: wide spread = thin book = high slippage risk, skip.

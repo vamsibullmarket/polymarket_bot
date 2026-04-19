@@ -95,6 +95,9 @@ function buildRedeemData(conditionId: string): string {
     log.write(`[claim-cron] checking ${inputSlugs.length} slug(s)`, "dim");
   
     const keep: string[] = [];
+    /** Removed from file: no winning-token balance (lost, already redeemed, stale line). */
+    const prunedZeroShares: string[] = [];
+    let claimTxOk = 0;
   
     for (const slug of inputSlugs) {
       try {
@@ -127,10 +130,7 @@ function buildRedeemData(conditionId: string): string {
         const beforeShares = await clobClient.getAvailableShares(winningTokenId);
   
         if (beforeShares < MIN_CLAIMABLE_SHARES) {
-          log.write(
-            `[claim-cron] ${slug}: claimable shares=${beforeShares.toFixed(6)} (< ${MIN_CLAIMABLE_SHARES}), dropping`,
-            "dim",
-          );
+          prunedZeroShares.push(slug);
           continue;
         }
   
@@ -171,6 +171,7 @@ function buildRedeemData(conditionId: string): string {
           continue;
         }
   
+        claimTxOk++;
         log.write(
           `[claim-cron] ${slug}: claimed tx=${txHash} shares ${beforeShares.toFixed(6)} -> ${afterShares.toFixed(6)} collateral ${beforeCollateral.toFixed(6)} -> ${afterCollateral.toFixed(6)}`,
           "green",
@@ -182,8 +183,20 @@ function buildRedeemData(conditionId: string): string {
     }
   
     writeWinningSlugs(WINNERS_PATH, keep);
+  
+    if (prunedZeroShares.length > 0) {
+      const sample = prunedZeroShares.slice(0, 20).join(", ");
+      const suffix =
+        prunedZeroShares.length > 20 ? ` … (+${prunedZeroShares.length - 20} more)` : "";
+      log.write(
+        `[claim-cron] pruned ${prunedZeroShares.length} slug(s) from file (0 winning-token shares — lost / already claimed / stale). ${sample}${suffix}`,
+        "dim",
+      );
+    }
+  
+    const removedFromFile = inputSlugs.length - keep.length;
     log.write(
-      `[claim-cron] cycle complete: remaining=${keep.length} claimed=${inputSlugs.length - keep.length}`,
+      `[claim-cron] cycle complete: remainingInFile=${keep.length} removedFromFile=${removedFromFile} claimTxOk=${claimTxOk} prunedZeroShares=${prunedZeroShares.length}`,
       "dim",
     );
   }
