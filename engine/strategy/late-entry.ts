@@ -246,19 +246,22 @@ const OPEN_PRICE_HARD_TIMEOUT_S = 90;
 
 const ENTRY_STRATEGY: "v1" | "v2" = "v2";
 
-/** When `remaining <` this, use `checkEntryV2FinalStretch`. */
-const TIGHT_ENTRY_REMAINING_THRESHOLD = 35;
+/** When `remaining <` this, use `checkEntryV2FinalStretch` (last ~25s). */
+const TIGHT_ENTRY_REMAINING_THRESHOLD = 25;
 /** Final-stretch CLOB band (inclusive) and liquidity floor. */
-const TIGHT_ENTRY_PRICE_MIN = 0.75;
+const TIGHT_ENTRY_PRICE_MIN = 0.7;
 const TIGHT_ENTRY_PRICE_MAX = 0.91;
 const TIGHT_ENTRY_MIN_LIQUIDITY = 120;
 
-const FINAL_STRETCH_PEAK_GAP_RATIO_MIN = 0.55;
-const FINAL_STRETCH_GAP_SAFETY_MIN = 8;
+const FINAL_STRETCH_PEAK_GAP_RATIO_MIN = 0.5;
+const FINAL_STRETCH_GAP_SAFETY_MIN = 7;
+const FINAL_STRETCH_MAX_DIVERGENCE = 26;
+/** Fixed per-share stop for final-stretch fills only (tighter than entry−0.20). */
+const FINAL_STRETCH_STOP_LOSS_PRICE = 0.5;
 
 /** V2 early-trend window (seconds remaining): |gap| > 80, ask 0.75–0.90, relaxed divergence. */
 const EARLY_TREND_REMAINING_MIN = 151;
-const EARLY_TREND_REMAINING_MAX = 240;
+const EARLY_TREND_REMAINING_MAX = 270;
 /** Reject when |gap| <= this (USD vs open). */
 const EARLY_TREND_MIN_ABS_GAP = 80;
 const EARLY_TREND_PRICE_MIN = 0.75;
@@ -558,8 +561,8 @@ function explainNoSignal(params: {
     const gap = params.btcPrice - params.priceToBeat;
     values.push(`gap=${gap.toFixed(2)}`);
 
-    if (params.remaining > 240) {
-      reasons.push(`early_trend_in=${params.remaining - 240}s`);
+    if (params.remaining > 270) {
+      reasons.push(`early_trend_in=${params.remaining - 270}s`);
     } else if (
       ENTRY_STRATEGY === "v2" &&
       params.remaining >= EARLY_TREND_REMAINING_MIN &&
@@ -658,8 +661,8 @@ function explainNoSignal(params: {
       if (params.atr === null) reasons.push("atr_not_ready");
       else if (params.atr > 22) reasons.push(`atr_too_high=${params.atr.toFixed(2)}`);
 
-      const div = params.divergence ?? Infinity;
-      if (div > 18) {
+      const divFs = params.divergence ?? Infinity;
+      if (divFs > FINAL_STRETCH_MAX_DIVERGENCE) {
         reasons.push(`divergence_too_high=${params.divergence?.toFixed(2) ?? "na"}`);
       }
 
@@ -747,9 +750,14 @@ function explainNoSignal(params: {
       if (upStrong && gap < -20) reasons.push(`gap_contradicts_up(gap=${gap.toFixed(0)})`);
       if (downStrong && !upStrong && gap > 20) reasons.push(`gap_contradicts_down(gap=${gap.toFixed(0)})`);
     } else {
-      // Mirror checkEntryV2 normal path: 35 <= remaining <= 150
-      if (params.remaining < 35 || params.remaining > 150) {
-        reasons.push(`outside_v2_normal_window(need_35-150_remaining=${params.remaining})`);
+      // Mirror checkEntryV2 normal path: TIGHT_ENTRY_REMAINING_THRESHOLD..150
+      if (
+        params.remaining < TIGHT_ENTRY_REMAINING_THRESHOLD ||
+        params.remaining > 150
+      ) {
+        reasons.push(
+          `outside_v2_normal_window(need_${TIGHT_ENTRY_REMAINING_THRESHOLD}-150_remaining=${params.remaining})`,
+        );
       }
 
       if (params.atr === null) reasons.push("atr_not_ready");
@@ -828,7 +836,7 @@ function sharesForNotional(price: number, notionalUsd = TARGET_ORDER_USD): numbe
 }
 
 /**
- * V2 entry for 151–240s remaining: |gap| > 80, ask in [0.75, 0.90], divergence cap 35.
+ * V2 entry for 151–270s remaining: |gap| > 80, ask in [0.75, 0.90], divergence cap 35.
  * Programmatic exit still uses `bidFloorUsd` 0.25 + market-turn (`positionExitShouldTrigger`).
  */
 function checkEntryV2EarlyTrend(params: {
@@ -954,7 +962,7 @@ function checkEntryV2EarlyTrend(params: {
 
 /**
  * When `remaining < TIGHT_ENTRY_REMAINING_THRESHOLD`: CLOB band [TIGHT_ENTRY_PRICE_MIN, TIGHT_ENTRY_PRICE_MAX],
- * liquidity >= TIGHT_ENTRY_MIN_LIQUIDITY, plus peakGap / gapSafety when present (same thresholds as normal V2).
+ * relaxed divergence/peak/safety vs older final stretch; stop on signal is `FINAL_STRETCH_STOP_LOSS_PRICE`.
  */
 function checkEntryV2FinalStretch(params: {
   remaining: number;
@@ -976,7 +984,7 @@ function checkEntryV2FinalStretch(params: {
   }
 
   const div = divergence ?? Infinity;
-  if (div > 18) {
+  if (div > FINAL_STRETCH_MAX_DIVERGENCE) {
     return null;
   }
 
@@ -1053,7 +1061,7 @@ function checkEntryV2FinalStretch(params: {
     return null;
   }
 
-  const stopLossPrice = Math.max(0.5, info.price - 0.2);
+  const stopLossPrice = FINAL_STRETCH_STOP_LOSS_PRICE;
 
   return {
     side,
@@ -1071,8 +1079,8 @@ function checkEntryV2FinalStretch(params: {
  *  - When both sides are strong, gap direction wins the tiebreaker first;
  *    price*liquidity score is only a secondary tiebreaker when gap is near zero
  *  - Entry price band (normal window): 0.74–0.90 per existing filters
- *  - When `remaining < 35` (and >= 1): see `checkEntryV2FinalStretch` (0.85–0.90 tight band)
- *  - When `151 <= remaining <= 240`: see `checkEntryV2EarlyTrend`
+ *  - When `remaining < TIGHT_ENTRY_REMAINING_THRESHOLD`: see `checkEntryV2FinalStretch`
+ *  - When `151 <= remaining <= 270`: see `checkEntryV2EarlyTrend`
  */
 function checkEntryV2(params: {
   remaining: number;
@@ -1104,8 +1112,8 @@ function checkEntryV2(params: {
     return checkEntryV2FinalStretch(params);
   }
 
-  // --- Time window: normal path 35..150 ---
-  if (remaining < 35 || remaining > 150) {
+  // --- Time window: normal path TIGHT_ENTRY_REMAINING_THRESHOLD..150 ---
+  if (remaining < TIGHT_ENTRY_REMAINING_THRESHOLD || remaining > 150) {
     return null;
   }
 
@@ -1240,7 +1248,7 @@ function checkEntry(params: {
     divergence,
   } = params;
 
-  if (remaining < 35 || remaining > 150) {
+  if (remaining < TIGHT_ENTRY_REMAINING_THRESHOLD || remaining > 150) {
     return null;
   }
 
