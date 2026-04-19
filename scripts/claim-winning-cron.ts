@@ -173,7 +173,7 @@ function buildRedeemData(conditionId: string): string {
   
         claimTxOk++;
         log.write(
-          `[claim-cron] ${slug}: claimed tx=${txHash} shares ${beforeShares.toFixed(6)} -> ${afterShares.toFixed(6)} collateral ${beforeCollateral.toFixed(6)} -> ${afterCollateral.toFixed(6)}`,
+          `[claim-cron] ${slug}: claimed tx=${txHash} shares ${beforeShares.toFixed(6)} -> ${afterShares.toFixed(6)} collateral ${beforeCollateral.toFixed(6)} -> ${afterCollateral.toFixed(6)} (slug removed from ${WINNERS_PATH})`,
           "green",
         );
       } catch (e) {

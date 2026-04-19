@@ -129,18 +129,10 @@ export class EarlyBird {
     const state = loadState(this._statePath);
     if (state) {
       log.write(`[startup] Loading state from ${this._statePath}`);
-      this._sessionPnl = state.sessionPnl;
-      this._sessionLoss = state.sessionLoss ?? 0;
-
-      if (Math.abs(this._sessionLoss) >= this._minSessionPnl) {
-        log.write(
-          `[startup] Session loss from previous session ($${this._sessionLoss.toFixed(2)}) already meets or exceeds the MAX_SESSION_LOSS threshold (-$${this._minSessionPnl.toFixed(2)}). ` +
-          `The engine would shut down immediately. ` +
-          `To start fresh, reset "sessionLoss" to 0 in ${this._statePath}, or increase MAX_SESSION_LOSS in your .env.`,
-          "red",
-        );
-        process.exit(1);
-      }
+      log.write(
+        `[startup] Prior persisted session (discarded after recovery): pnl=${state.sessionPnl} loss=${state.sessionLoss ?? 0} completedMarkets=${state.completedMarkets?.length ?? 0}`,
+        "dim",
+      );
 
       // Sim recovery: replay order history to reconstruct balance
       if (!this._prod) {
@@ -166,6 +158,15 @@ export class EarlyBird {
       for (const [slug, lifecycle] of recovered) {
         this._lifecycles.set(slug, lifecycle);
       }
+
+      this._sessionPnl = 0;
+      this._sessionLoss = 0;
+      this._completedMarkets = [];
+      log.write(
+        "[startup] Session PnL/loss and completedMarkets reset for this run; active lifecycles preserved",
+        "dim",
+      );
+      this._saveState();
     } else {
       log.write("[startup] No saved state found. Starting fresh.");
     }
