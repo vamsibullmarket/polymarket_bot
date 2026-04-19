@@ -1,16 +1,19 @@
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { Interface } from "ethers/lib/utils";
-import { createWalletClient, http, type Hex } from "viem";
+import { createWalletClient, http, type Hex, type WalletClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
 import { RelayClient } from "@polymarket/builder-relayer-client";
 import { PolymarketEarlyBirdClient } from "../engine/client.ts";
+import { submitSafeTransactionViaRelayerApi } from "../engine/relayer-safe-submit.ts";
 import { fetchWithRetry } from "../utils/fetch-retry.ts";
 import { log } from "../engine/log.ts";
 import { acquireProcessLock } from "../utils/process-lock.ts";
 
 const WINNERS_PATH = "state/winning-btc-5m.txt";
 const POLL_MS = 5 * 60 * 1000;
+const CHAIN_ID = 137;
+const DEFAULT_RELAYER_BASE = "https://relayer-v2.polymarket.com";
 
 const CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 const COLLATERAL_TOKEN = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
@@ -82,9 +85,42 @@ function buildRedeemData(conditionId: string): string {
     ]);
   }
 
+type ClaimSubmit =
+  | { kind: "builder"; relayer: RelayClient }
+  | {
+      kind: "relayer-api";
+      wallet: WalletClient;
+      relayerBaseUrl: string;
+      relayerApiKey: string;
+      relayerApiKeyAddress: string;
+    };
+
+async function submitClaimTransaction(
+  submit: ClaimSubmit,
+  tx: { to: string; data: string; value: string },
+  slug: string,
+): Promise<string> {
+  if (submit.kind === "builder") {
+    const response = await submit.relayer.execute([tx], `claim ${slug}`);
+    const result = await response.wait();
+    return ((result as { transactionHash?: string })?.transactionHash ?? "unknown") as string;
+  }
+
+  const r = await submitSafeTransactionViaRelayerApi({
+    wallet: submit.wallet,
+    chainId: CHAIN_ID,
+    relayerBaseUrl: submit.relayerBaseUrl,
+    relayerApiKey: submit.relayerApiKey,
+    relayerApiKeyAddress: submit.relayerApiKeyAddress,
+    transaction: tx,
+    metadata: `claim ${slug}`,
+  });
+  return r.transactionHash || "unknown";
+}
+
   async function claimCycle(
     clobClient: PolymarketEarlyBirdClient,
-    relayer: RelayClient,
+    submit: ClaimSubmit,
   ): Promise<void> {
     const inputSlugs = readWinningSlugs(WINNERS_PATH);
     if (inputSlugs.length === 0) {
@@ -148,9 +184,7 @@ function buildRedeemData(conditionId: string): string {
           "cyan",
         );
   
-        const response = await relayer.execute([tx], `claim ${slug}`);
-        const result = await response.wait();
-        const txHash = (result as any)?.transactionHash ?? "unknown";
+        const txHash = await submitClaimTransaction(submit, tx, slug);
   
         await clobClient.updateAvailableShares(winningTokenId);
         const afterShares = await clobClient.getAvailableShares(winningTokenId);
@@ -212,16 +246,23 @@ export async function startClaimWinningCron(opts?: {
     if (!privateKey?.startsWith("0x")) {
       throw new Error("PRIVATE_KEY is required");
     }
-  
+
+    const relayerApiKey = process.env.RELAYER_API_KEY?.trim();
+    const relayerApiKeyAddress = process.env.RELAYER_API_KEY_ADDRESS?.trim();
+    const useRelayerApi =
+      Boolean(relayerApiKey) && Boolean(relayerApiKeyAddress);
+
     const builderApiKey = process.env.BUILDER_API_KEY;
     const builderSecret = process.env.BUILDER_SECRET;
     const builderPassphrase =
       process.env.BUILDER_PASSPHRASE ?? process.env.BUILDER_PASS_PHRASE;
-  
-    if (!builderApiKey || !builderSecret || !builderPassphrase) {
-      throw new Error(
-        "BUILDER_API_KEY, BUILDER_SECRET, and BUILDER_PASSPHRASE (or BUILDER_PASS_PHRASE) are required",
-      );
+
+    if (!useRelayerApi) {
+      if (!builderApiKey || !builderSecret || !builderPassphrase) {
+        throw new Error(
+          "Either set RELAYER_API_KEY + RELAYER_API_KEY_ADDRESS for direct relayer submit, or set BUILDER_API_KEY, BUILDER_SECRET, and BUILDER_PASSPHRASE (or BUILDER_PASS_PHRASE) for RelayClient",
+        );
+      }
     }
   
     const account = privateKeyToAccount(privateKey);
@@ -230,30 +271,55 @@ export async function startClaimWinningCron(opts?: {
       chain: polygon,
       transport: http(process.env.RPC_URL ?? "https://polygon-rpc.com"),
     });
-  
-    const { BuilderConfig } = await import("@polymarket/builder-signing-sdk");
-    const builderConfig = new BuilderConfig({
-      localBuilderCreds: {
-        key: builderApiKey,
-        secret: builderSecret,
-        passphrase: builderPassphrase,
-      },
-    });
-  
-    const relayer = new RelayClient(
-      "https://relayer-v2.polymarket.com/",
-      137,
-      wallet,
-      builderConfig,
-    );
+
+    let submit: ClaimSubmit;
+
+    if (useRelayerApi && relayerApiKey && relayerApiKeyAddress) {
+      if (account.address.toLowerCase() !== relayerApiKeyAddress.toLowerCase()) {
+        throw new Error(
+          "RELAYER_API_KEY_ADDRESS must match the address derived from PRIVATE_KEY",
+        );
+      }
+      const relayerBaseUrl =
+        process.env.RELAYER_BASE_URL?.trim() ?? DEFAULT_RELAYER_BASE;
+      submit = {
+        kind: "relayer-api",
+        wallet,
+        relayerBaseUrl,
+        relayerApiKey,
+        relayerApiKeyAddress,
+      };
+      log.write(
+        "[claim-cron] submit mode=relayer-api (RELAYER_API_KEY + RELAYER_API_KEY_ADDRESS)",
+        "dim",
+      );
+    } else {
+      const { BuilderConfig } = await import("@polymarket/builder-signing-sdk");
+      const builderConfig = new BuilderConfig({
+        localBuilderCreds: {
+          key: builderApiKey!,
+          secret: builderSecret!,
+          passphrase: builderPassphrase!,
+        },
+      });
+
+      const relayer = new RelayClient(
+        `${DEFAULT_RELAYER_BASE}/`,
+        CHAIN_ID,
+        wallet,
+        builderConfig,
+      );
+      submit = { kind: "builder", relayer };
+      log.write("[claim-cron] submit mode=builder (RelayClient + BuilderConfig)", "dim");
+    }
   
     const clobClient = new PolymarketEarlyBirdClient();
     await clobClient.init();
   
     // Run immediately, then every 5 minutes.
-    await claimCycle(clobClient, relayer);
+    await claimCycle(clobClient, submit);
     setInterval(() => {
-      claimCycle(clobClient, relayer).catch((e) => {
+      claimCycle(clobClient, submit).catch((e) => {
         log.write(`[claim-cron] unhandled cycle error=${String(e)}`, "red");
       });
     }, POLL_MS);

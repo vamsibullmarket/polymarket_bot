@@ -3,7 +3,8 @@
   "module": "index.ts",
   "type": "module",
   "scripts": {
-    "check": "tsc -b --noEmit"
+    "check": "tsc -b --noEmit",
+    "test:relayer-redeem": "bun scripts/test-relayer-redeem.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",
