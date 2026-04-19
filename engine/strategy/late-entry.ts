@@ -239,7 +239,7 @@ const OPEN_PRICE_HARD_TIMEOUT_S = 90;
 const ENTRY_STRATEGY: "v1" | "v2" = "v2";
 
 /** Only when `remaining < 25`: tight band + liquidity (see `checkEntryV2FinalStretch`). */
-const TIGHT_ENTRY_REMAINING_THRESHOLD = 25;
+const TIGHT_ENTRY_REMAINING_THRESHOLD = 35;
 const TIGHT_ENTRY_PRICE_MIN = 0.85;
 const TIGHT_ENTRY_PRICE_MAX = 0.9;
 const TIGHT_ENTRY_MIN_LIQUIDITY = 80;
@@ -689,7 +689,7 @@ function checkEntryV2FinalStretch(params: {
  *  - When both sides are strong, gap direction wins the tiebreaker first;
  *    price*liquidity score is only a secondary tiebreaker when gap is near zero
  *  - Entry price band (normal window): 0.74–0.90 per existing filters
- *  - When `remaining < 25` (and >= 1): see `checkEntryV2FinalStretch` (0.85–0.90 tight band)
+ *  - When `remaining < 35` (and >= 1): see `checkEntryV2FinalStretch` (0.85–0.90 tight band)
  */
 function checkEntryV2(params: {
   remaining: number;
@@ -715,7 +715,7 @@ function checkEntryV2(params: {
   }
 
   // --- Time window: 150 seconds remaining (unchanged: 25..150) ---
-  if (remaining < 25 || remaining > 150) {
+  if (remaining < 35 || remaining > 150) {
     return null;
   }
 
@@ -850,7 +850,7 @@ function checkEntry(params: {
     divergence,
   } = params;
 
-  if (remaining < 25 || remaining > 150) {
+  if (remaining < 35 || remaining > 150) {
     return null;
   }
 
