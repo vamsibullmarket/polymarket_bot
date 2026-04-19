@@ -1,13 +1,14 @@
 import { appendFileSync, mkdirSync, readdirSync, unlinkSync, statSync } from "fs";
 import { join } from "path";
 
-export type LogColor = "green" | "yellow" | "red" | "cyan" | "dim";
+export type LogColor = "green" | "yellow" | "red" | "cyan" | "magenta" | "dim";
 
 const ANSI: Record<LogColor, string> = {
   green: "\x1b[32m",
   yellow: "\x1b[33m",
   red: "\x1b[31m",
   cyan: "\x1b[36m",
+  magenta: "\x1b[35m",
   dim: "\x1b[2m",
 };
 const RESET = "\x1b[0m";

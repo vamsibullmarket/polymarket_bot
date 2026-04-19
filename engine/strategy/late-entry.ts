@@ -250,6 +250,47 @@ const SETTLEMENT_PREVIEW_LOSS_MAX = 0.02;
 
 const WINS_AND_LOSSES_PATH = "state/winsAndLosses.txt";
 
+function formatSignalTriggerLine(
+  slug: string,
+  params: {
+    remaining: number;
+    path: "final_stretch" | "normal";
+    signal: EntrySignal;
+    gap: number;
+    liveBtc: number;
+    oraclePrice: number | undefined;
+    priceToBeat: number;
+    spread: number | null;
+    up: { price: number; liquidity: number } | null;
+    down: { price: number; liquidity: number } | null;
+    rsi: number | null;
+    atr: number | null;
+    rtv: number | null;
+    gapSafety: number | null;
+    peakGapRatio: number | null;
+    divergence: number | null;
+    binancePrice: number | undefined;
+    coinbasePrice: number | undefined;
+  },
+): string {
+  const u = params.up;
+  const d = params.down;
+  const upS = u ? `${u.price.toFixed(2)}@${u.liquidity.toFixed(0)}` : "na";
+  const downS = d ? `${d.price.toFixed(2)}@${d.liquidity.toFixed(0)}` : "na";
+  return (
+    `[${slug}] late-entry: SIGNAL_TRIGGER path=${params.path} remaining=${params.remaining}s ` +
+    `side=${params.signal.side} ask=${params.signal.ask.toFixed(4)} ` +
+    `spread=${params.spread != null ? params.spread.toFixed(4) : "na"} ` +
+    `gap=${params.gap.toFixed(2)} gapAbs=${params.signal.gap.toFixed(2)} ` +
+    `gapSafety=${params.gapSafety?.toFixed(2) ?? "na"} peakGap=${params.peakGapRatio?.toFixed(2) ?? "na"} ` +
+    `live=${params.liveBtc.toFixed(2)} oracle=${params.oraclePrice?.toFixed(2) ?? "na"} open=${params.priceToBeat.toFixed(2)} ` +
+    `binance=${params.binancePrice?.toFixed(2) ?? "na"} coinbase=${params.coinbasePrice?.toFixed(2) ?? "na"} ` +
+    `rsi=${params.rsi?.toFixed(1) ?? "na"} atr=${params.atr?.toFixed(2) ?? "na"} rtv=${params.rtv?.toFixed(2) ?? "na"} ` +
+    `div=${params.divergence?.toFixed(2) ?? "na"} ` +
+    `up=${upS} down=${downS} liq_chosen=${params.signal.liquidity.toFixed(0)} stop=${params.signal.stopLossPrice.toFixed(2)}`
+  );
+}
+
 function readWinsAndLosses(): { wins: number; losses: number } {
   let wins = 0;
   let losses = 0;
@@ -1466,9 +1507,31 @@ export const lateEntry: Strategy = async (ctx) => {
           if (state.signalConfirmTicks >= 1) {
             state.hasEntered = true;
             state.signalConfirmTicks = 0;
+            const entryPath: "final_stretch" | "normal" =
+              remaining < TIGHT_ENTRY_REMAINING_THRESHOLD ? "final_stretch" : "normal";
+
             ctx.log(
-              `[${ctx.slug}] late-entry: signal ${signal.side} @ ${signal.ask} (gap ${signal.gap.toFixed(0)}, liq $${signal.liquidity.toFixed(0)})`,
-              "cyan",
+              formatSignalTriggerLine(ctx.slug, {
+                remaining,
+                path: entryPath,
+                signal,
+                gap,
+                liveBtc: liveBtcPrice,
+                oraclePrice,
+                priceToBeat,
+                spread: currentBid !== null ? signal.ask - currentBid : null,
+                up,
+                down,
+                rsi: indicators.rsi,
+                atr: indicators.atr,
+                rtv: indicators.rtv,
+                gapSafety: indicators.gapSafety(gap),
+                peakGapRatio: indicators.peakGapRatio(gap),
+                divergence: ctx.ticker.divergence,
+                binancePrice,
+                coinbasePrice,
+              }),
+              "magenta",
             );
             placeEntry(ctx, state, signal);
           } else {
