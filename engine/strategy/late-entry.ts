@@ -256,6 +256,18 @@ const TIGHT_ENTRY_MIN_LIQUIDITY = 120;
 const FINAL_STRETCH_PEAK_GAP_RATIO_MIN = 0.55;
 const FINAL_STRETCH_GAP_SAFETY_MIN = 8;
 
+/** V2 early-trend window (seconds remaining): |gap| > 80, ask 0.75–0.90, relaxed divergence. */
+const EARLY_TREND_REMAINING_MIN = 151;
+const EARLY_TREND_REMAINING_MAX = 240;
+/** Reject when |gap| <= this (USD vs open). */
+const EARLY_TREND_MIN_ABS_GAP = 80;
+const EARLY_TREND_PRICE_MIN = 0.75;
+const EARLY_TREND_PRICE_MAX = 0.9;
+const EARLY_TREND_MAX_DIVERGENCE = 35;
+const EARLY_TREND_MIN_LIQUIDITY = 150;
+const EARLY_TREND_MIN_GAP_SAFETY = 7;
+const EARLY_TREND_MIN_PEAK_GAP_RATIO = 0.48;
+
 /** Prefer best bid on held side vs this threshold; fallback to mid if no bid. */
 const SETTLEMENT_PREVIEW_THRESHOLD = 0.5;
 
@@ -275,7 +287,7 @@ function formatSignalTriggerLine(
   slug: string,
   params: {
     remaining: number;
-    path: "final_stretch" | "normal";
+    path: "final_stretch" | "normal" | "early_trend";
     signal: EntrySignal;
     gap: number;
     liveBtc: number;
@@ -546,8 +558,99 @@ function explainNoSignal(params: {
     const gap = params.btcPrice - params.priceToBeat;
     values.push(`gap=${gap.toFixed(2)}`);
 
-    if (params.remaining > 150) {
-      reasons.push(`entry_in=${params.remaining - 150}s`);
+    if (params.remaining > 240) {
+      reasons.push(`early_trend_in=${params.remaining - 240}s`);
+    } else if (
+      ENTRY_STRATEGY === "v2" &&
+      params.remaining >= EARLY_TREND_REMAINING_MIN &&
+      params.remaining <= EARLY_TREND_REMAINING_MAX
+    ) {
+      // Mirror checkEntryV2EarlyTrend
+      if (params.atr === null) {
+        reasons.push("atr_not_ready");
+      } else if (params.atr > 22) {
+        reasons.push(`atr_too_high=${params.atr.toFixed(2)}`);
+      }
+
+      const divEt = params.divergence ?? Infinity;
+      if (divEt > EARLY_TREND_MAX_DIVERGENCE) {
+        reasons.push(`divergence_too_high=${params.divergence?.toFixed(2) ?? "na"}`);
+      }
+
+      if (params.rsi === null) {
+        reasons.push("rsi_not_ready");
+      } else {
+        const inEarlyBand = (p: { price: number; liquidity: number } | null) =>
+          p !== null &&
+          p.price >= EARLY_TREND_PRICE_MIN &&
+          p.price <= EARLY_TREND_PRICE_MAX &&
+          p.liquidity >= EARLY_TREND_MIN_LIQUIDITY;
+
+        const upStrongEt = inEarlyBand(params.up);
+        const downStrongEt = inEarlyBand(params.down);
+
+        if (!upStrongEt && !downStrongEt) {
+          reasons.push(
+            `early_trend_no_band_side(need_${EARLY_TREND_PRICE_MIN}-${EARLY_TREND_PRICE_MAX}@liq>=${EARLY_TREND_MIN_LIQUIDITY})`,
+          );
+        } else {
+          let sideEt: "UP" | "DOWN";
+          let infoEt: { price: number; liquidity: number };
+          if (upStrongEt && downStrongEt) {
+            if (gap > 8) {
+              sideEt = "UP";
+              infoEt = params.up!;
+            } else if (gap < -8) {
+              sideEt = "DOWN";
+              infoEt = params.down!;
+            } else {
+              const upScoreEt = params.up!.price * params.up!.liquidity;
+              const downScoreEt = params.down!.price * params.down!.liquidity;
+              sideEt = upScoreEt >= downScoreEt ? "UP" : "DOWN";
+              infoEt = sideEt === "UP" ? params.up! : params.down!;
+            }
+          } else if (upStrongEt) {
+            sideEt = "UP";
+            infoEt = params.up!;
+          } else {
+            sideEt = "DOWN";
+            infoEt = params.down!;
+          }
+
+          if (Math.abs(gap) <= EARLY_TREND_MIN_ABS_GAP) {
+            reasons.push(`gap_not_large_enough(need_|gap|>${EARLY_TREND_MIN_ABS_GAP})`);
+          }
+          if (
+            params.peakGapRatio !== null &&
+            params.peakGapRatio < EARLY_TREND_MIN_PEAK_GAP_RATIO
+          ) {
+            reasons.push(`peak_gap_ratio_low=${params.peakGapRatio.toFixed(2)}`);
+          }
+          if (
+            params.gapSafety !== null &&
+            params.gapSafety < EARLY_TREND_MIN_GAP_SAFETY
+          ) {
+            reasons.push(`gap_safety_low=${params.gapSafety.toFixed(2)}`);
+          }
+          if (sideEt === "UP" && params.rsi < 30) {
+            reasons.push(`early_trend_rsi_contradicts_up(rsi=${params.rsi.toFixed(1)})`);
+          }
+          if (sideEt === "DOWN" && params.rsi > 70) {
+            reasons.push(`early_trend_rsi_contradicts_down(rsi=${params.rsi.toFixed(1)})`);
+          }
+          if (sideEt === "UP" && gap < -8) {
+            reasons.push(`gap_contradicts_up(gap=${gap.toFixed(0)})`);
+          }
+          if (sideEt === "DOWN" && gap > 8) {
+            reasons.push(`gap_contradicts_down(gap=${gap.toFixed(0)})`);
+          }
+          if (params.atr !== null && params.atr < 0.05) {
+            reasons.push(`atr_frozen_low=${params.atr.toFixed(2)}`);
+          }
+        }
+      }
+    } else if (params.remaining > 150) {
+      reasons.push(`normal_window_in=${params.remaining - 150}s`);
     } else if (params.remaining < 1) {
       reasons.push(`too_late(remaining=${params.remaining}s)`);
     } else if (isV2FinalStretch) {
@@ -725,6 +828,131 @@ function sharesForNotional(price: number, notionalUsd = TARGET_ORDER_USD): numbe
 }
 
 /**
+ * V2 entry for 151–240s remaining: |gap| > 80, ask in [0.75, 0.90], divergence cap 35.
+ * Programmatic exit still uses `bidFloorUsd` 0.25 + market-turn (`positionExitShouldTrigger`).
+ */
+function checkEntryV2EarlyTrend(params: {
+  remaining: number;
+  btcPrice: number;
+  priceToBeat: number;
+  up: { price: number; liquidity: number } | null;
+  down: { price: number; liquidity: number } | null;
+  rsi: number | null;
+  atr: number | null;
+  rtv: number | null;
+  gapSafety: number | null;
+  divergence: number | null;
+  peakGapRatio: number | null;
+}): EntrySignal | null {
+  const { btcPrice, priceToBeat, up, down, atr, divergence, rsi } = params;
+
+  if (
+    params.remaining < EARLY_TREND_REMAINING_MIN ||
+    params.remaining > EARLY_TREND_REMAINING_MAX
+  ) {
+    return null;
+  }
+
+  if (atr === null || atr > 22) {
+    return null;
+  }
+
+  const div = divergence ?? Infinity;
+  if (div > EARLY_TREND_MAX_DIVERGENCE) {
+    return null;
+  }
+
+  if (rsi === null) {
+    return null;
+  }
+
+  const gap = btcPrice - priceToBeat;
+
+  if (Math.abs(gap) <= EARLY_TREND_MIN_ABS_GAP) {
+    return null;
+  }
+
+  if (
+    params.gapSafety !== null &&
+    params.gapSafety < EARLY_TREND_MIN_GAP_SAFETY
+  ) {
+    return null;
+  }
+
+  if (
+    params.peakGapRatio !== null &&
+    params.peakGapRatio < EARLY_TREND_MIN_PEAK_GAP_RATIO
+  ) {
+    return null;
+  }
+
+  const inBand = (p: { price: number; liquidity: number } | null) =>
+    p !== null &&
+    p.price >= EARLY_TREND_PRICE_MIN &&
+    p.price <= EARLY_TREND_PRICE_MAX &&
+    p.liquidity >= EARLY_TREND_MIN_LIQUIDITY;
+
+  const upStrong = inBand(up);
+  const downStrong = inBand(down);
+
+  if (!upStrong && !downStrong) {
+    return null;
+  }
+
+  let side: "UP" | "DOWN";
+  let info: { price: number; liquidity: number };
+
+  if (upStrong && downStrong) {
+    if (gap > 8) {
+      side = "UP";
+      info = up!;
+    } else if (gap < -8) {
+      side = "DOWN";
+      info = down!;
+    } else {
+      const upScore = up!.price * up!.liquidity;
+      const downScore = down!.price * down!.liquidity;
+      side = upScore >= downScore ? "UP" : "DOWN";
+      info = side === "UP" ? up! : down!;
+    }
+  } else if (upStrong) {
+    side = "UP";
+    info = up!;
+  } else {
+    side = "DOWN";
+    info = down!;
+  }
+
+  if (side === "UP" && gap < -8) {
+    return null;
+  }
+  if (side === "DOWN" && gap > 8) {
+    return null;
+  }
+
+  if (side === "UP" && rsi < 30) {
+    return null;
+  }
+  if (side === "DOWN" && rsi > 70) {
+    return null;
+  }
+
+  if (atr !== null && atr < 0.05) {
+    return null;
+  }
+
+  const stopLossPrice = Math.max(0.5, info.price - 0.2);
+
+  return {
+    side,
+    ask: info.price,
+    gap: Math.abs(gap),
+    liquidity: info.liquidity,
+    stopLossPrice,
+  };
+}
+
+/**
  * When `remaining < TIGHT_ENTRY_REMAINING_THRESHOLD`: CLOB band [TIGHT_ENTRY_PRICE_MIN, TIGHT_ENTRY_PRICE_MAX],
  * liquidity >= TIGHT_ENTRY_MIN_LIQUIDITY, plus peakGap / gapSafety when present (same thresholds as normal V2).
  */
@@ -844,6 +1072,7 @@ function checkEntryV2FinalStretch(params: {
  *    price*liquidity score is only a secondary tiebreaker when gap is near zero
  *  - Entry price band (normal window): 0.74–0.90 per existing filters
  *  - When `remaining < 35` (and >= 1): see `checkEntryV2FinalStretch` (0.85–0.90 tight band)
+ *  - When `151 <= remaining <= 240`: see `checkEntryV2EarlyTrend`
  */
 function checkEntryV2(params: {
   remaining: number;
@@ -860,15 +1089,22 @@ function checkEntryV2(params: {
 }): EntrySignal | null {
   const { remaining, btcPrice, priceToBeat, up, down, atr, divergence, rsi } = params;
 
-  if (remaining < 1 || remaining > 150) {
+  if (remaining < 1) {
     return null;
+  }
+
+  if (
+    remaining >= EARLY_TREND_REMAINING_MIN &&
+    remaining <= EARLY_TREND_REMAINING_MAX
+  ) {
+    return checkEntryV2EarlyTrend(params);
   }
 
   if (remaining < TIGHT_ENTRY_REMAINING_THRESHOLD) {
     return checkEntryV2FinalStretch(params);
   }
 
-  // --- Time window: 150 seconds remaining (unchanged: 25..150) ---
+  // --- Time window: normal path 35..150 ---
   if (remaining < 35 || remaining > 150) {
     return null;
   }
@@ -1279,8 +1515,8 @@ function checkStopLoss(
         ` bid=${currentBid?.toFixed(2) ?? "none"}` +
         ` spread=${spread != null ? spread.toFixed(2) : "?"}` +
         ` gap=${gap?.toFixed(1) ?? "null"}` +
-        ` rem=${remaining}s` +
-        ` mktTurned=${turned}` +
+        ` remainingSec=${remaining}s` +
+        ` marketTurned=${turned}` +
         ` stop=${pos.stopLossPrice.toFixed(2)}` +
         ` stopGap=${stopGap.toFixed(2)}` +
         ` peak=${pos.maxSeenBid.toFixed(2)}` +
@@ -1726,8 +1962,13 @@ export const lateEntry: Strategy = async (ctx) => {
           if (state.signalConfirmTicks >= 1) {
             state.hasEntered = true;
             state.signalConfirmTicks = 0;
-            const entryPath: "final_stretch" | "normal" =
-              remaining < TIGHT_ENTRY_REMAINING_THRESHOLD ? "final_stretch" : "normal";
+            const entryPath: "final_stretch" | "normal" | "early_trend" =
+              remaining >= EARLY_TREND_REMAINING_MIN &&
+              remaining <= EARLY_TREND_REMAINING_MAX
+                ? "early_trend"
+                : remaining < TIGHT_ENTRY_REMAINING_THRESHOLD
+                  ? "final_stretch"
+                  : "normal";
 
             ctx.log(
               formatSignalTriggerLine(ctx.slug, {
