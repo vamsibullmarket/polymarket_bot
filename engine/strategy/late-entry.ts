@@ -1,6 +1,12 @@
 // Buy and Hold strategy
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "fs";
 import type { Strategy, StrategyContext } from "./types.ts";
 import { Env } from "../../utils/config.ts";
 import { getSlug } from "../../utils/slot.ts";
@@ -221,6 +227,8 @@ type LateEntryState = {
   lastTradeSide: "UP" | "DOWN" | null;
   /** One-shot CLOB hint before official resolution. */
   settlementPreviewLogged: boolean;
+  /** Set when programmatic exit starts; cleared after resolution TSV append. */
+  lastExitReason: string | null;
   released: boolean;
   signalConfirmTicks: number; // consecutive ticks with same signal — must hit 2 before entering
 };
@@ -248,11 +256,20 @@ const TIGHT_ENTRY_MIN_LIQUIDITY = 120;
 const FINAL_STRETCH_PEAK_GAP_RATIO_MIN = 0.55;
 const FINAL_STRETCH_GAP_SAFETY_MIN = 8;
 
-/** CLOB mid on your outcome token — tune if most rows are uncertain. */
-const SETTLEMENT_PREVIEW_WIN_MIN = 0.98;
-const SETTLEMENT_PREVIEW_LOSS_MAX = 0.02;
+/** Prefer best bid on held side vs this threshold; fallback to mid if no bid. */
+const SETTLEMENT_PREVIEW_THRESHOLD = 0.5;
 
 const WINS_AND_LOSSES_PATH = "state/winsAndLosses.txt";
+/** Tab: ISO slug side exitReason label priceUsed priceSource mid hindsight */
+const LATE_ENTRY_RESOLUTION_LOG_PATH = "state/late-entry-stop-resolution.txt";
+
+type WinsAndLossesTotals = {
+  wins: number;
+  losses: number;
+  stopLossHits: number;
+  stoppedThenPreviewWin: number;
+  stoppedThenPreviewLoss: number;
+};
 
 function formatSignalTriggerLine(
   slug: string,
@@ -295,50 +312,88 @@ function formatSignalTriggerLine(
   );
 }
 
-function readWinsAndLosses(): { wins: number; losses: number } {
-  let wins = 0;
-  let losses = 0;
+function readWinsAndLosses(): WinsAndLossesTotals {
+  const z: WinsAndLossesTotals = {
+    wins: 0,
+    losses: 0,
+    stopLossHits: 0,
+    stoppedThenPreviewWin: 0,
+    stoppedThenPreviewLoss: 0,
+  };
   if (!existsSync(WINS_AND_LOSSES_PATH)) {
-    return { wins, losses };
+    return z;
   }
   try {
     const raw = readFileSync(WINS_AND_LOSSES_PATH, "utf8");
     for (const line of raw.split("\n")) {
       const winM = line.match(/^\s*Wins:\s*(\d+)\s*$/i);
       const lossM = line.match(/^\s*Losses:\s*(\d+)\s*$/i);
+      const stopM = line.match(/^\s*StopLossHits:\s*(\d+)\s*$/i);
+      const stWinM = line.match(/^\s*StoppedThenPreviewWin:\s*(\d+)\s*$/i);
+      const stLossM = line.match(/^\s*StoppedThenPreviewLoss:\s*(\d+)\s*$/i);
       if (winM) {
-        wins = parseInt(winM[1]!, 10);
+        z.wins = parseInt(winM[1]!, 10);
       }
       if (lossM) {
-        losses = parseInt(lossM[1]!, 10);
+        z.losses = parseInt(lossM[1]!, 10);
+      }
+      if (stopM) {
+        z.stopLossHits = parseInt(stopM[1]!, 10);
+      }
+      if (stWinM) {
+        z.stoppedThenPreviewWin = parseInt(stWinM[1]!, 10);
+      }
+      if (stLossM) {
+        z.stoppedThenPreviewLoss = parseInt(stLossM[1]!, 10);
       }
     }
   } catch {
     // keep zeros on read error
   }
-  return { wins, losses };
+  return z;
 }
 
-function writeWinsAndLosses(wins: number, losses: number): void {
+function writeWinsAndLosses(t: WinsAndLossesTotals): void {
   mkdirSync("state", { recursive: true });
   writeFileSync(
     WINS_AND_LOSSES_PATH,
-    `Wins: ${wins}\nLosses: ${losses}\n`,
+    `Wins: ${t.wins}\n` +
+      `Losses: ${t.losses}\n` +
+      `StopLossHits: ${t.stopLossHits}\n` +
+      `StoppedThenPreviewWin: ${t.stoppedThenPreviewWin}\n` +
+      `StoppedThenPreviewLoss: ${t.stoppedThenPreviewLoss}\n`,
     "utf8",
   );
 }
 
-/** Bump wins/losses file when settlement-preview is logged; only win_preview / loss_preview increment. */
+function recordStopLossHit(): WinsAndLossesTotals {
+  const cur = readWinsAndLosses();
+  cur.stopLossHits += 1;
+  writeWinsAndLosses(cur);
+  return cur;
+}
+
+/**
+ * Bump wins/losses (+ hindsight buckets after programmatic exit) when settlement-preview is logged.
+ * `afterProgrammaticExit`: this trade used the exit path before preview — hindsight counters only then.
+ */
 function recordSettlementPreviewOutcome(
   label: "win_preview" | "loss_preview" | "uncertain" | "no_book",
-): { wins: number; losses: number } {
+  opts: { afterProgrammaticExit: boolean },
+): WinsAndLossesTotals {
   const cur = readWinsAndLosses();
   if (label === "win_preview") {
     cur.wins += 1;
+    if (opts.afterProgrammaticExit) {
+      cur.stoppedThenPreviewWin += 1;
+    }
   } else if (label === "loss_preview") {
     cur.losses += 1;
+    if (opts.afterProgrammaticExit) {
+      cur.stoppedThenPreviewLoss += 1;
+    }
   }
-  writeWinsAndLosses(cur.wins, cur.losses);
+  writeWinsAndLosses(cur);
   return cur;
 }
 
@@ -354,19 +409,72 @@ function midForOutcome(
   return ask ?? bid ?? null;
 }
 
+function signalPriceForSettlement(
+  ctx: StrategyContext,
+  side: "UP" | "DOWN",
+): { price: number | null; source: "bid" | "mid" } {
+  const bid = ctx.orderBook.bestBidPrice(side);
+  if (bid !== null && !Number.isNaN(bid)) {
+    return { price: bid, source: "bid" };
+  }
+  const mid = midForOutcome(ctx, side);
+  return { price: mid, source: "mid" };
+}
+
 function classifySettlementPreview(
-  mid: number | null,
+  signalPrice: number | null,
 ): "win_preview" | "loss_preview" | "uncertain" | "no_book" {
-  if (mid === null || Number.isNaN(mid)) {
+  if (signalPrice === null || Number.isNaN(signalPrice)) {
     return "no_book";
   }
-  if (mid >= SETTLEMENT_PREVIEW_WIN_MIN) {
+  if (signalPrice > SETTLEMENT_PREVIEW_THRESHOLD) {
     return "win_preview";
   }
-  if (mid <= SETTLEMENT_PREVIEW_LOSS_MAX) {
+  if (signalPrice < SETTLEMENT_PREVIEW_THRESHOLD) {
     return "loss_preview";
   }
   return "uncertain";
+}
+
+function hindsightFromLabel(
+  label: "win_preview" | "loss_preview" | "uncertain" | "no_book",
+): "would_have_won" | "would_have_lost" | "uncertain" | "no_book" {
+  if (label === "win_preview") {
+    return "would_have_won";
+  }
+  if (label === "loss_preview") {
+    return "would_have_lost";
+  }
+  if (label === "no_book") {
+    return "no_book";
+  }
+  return "uncertain";
+}
+
+function appendLateEntryResolutionRow(params: {
+  iso: string;
+  slug: string;
+  side: "UP" | "DOWN";
+  exitReason: string;
+  label: string;
+  priceUsed: string;
+  priceSource: string;
+  mid: string;
+  hindsight: string;
+}): void {
+  mkdirSync("state", { recursive: true });
+  const row = [
+    params.iso,
+    params.slug,
+    params.side,
+    params.exitReason.replace(/\t/g, " "),
+    params.label,
+    params.priceUsed,
+    params.priceSource,
+    params.mid,
+    params.hindsight,
+  ].join("\t");
+  appendFileSync(LATE_ENTRY_RESOLUTION_LOG_PATH, `${row}\n`, "utf8");
 }
 
 function explainNoSignal(params: {
@@ -1126,6 +1234,7 @@ function checkStopLoss(
 
   state.stopLossFired = true;
   state.exitInProgress = true;
+  state.lastExitReason = exitReason;
 
   const tokenId = pos.tokenId;
   const side = pos.side;
@@ -1133,7 +1242,11 @@ function checkStopLoss(
 
   let exitClosed = false;
 
-  const resetAfterExit = (message?: string, color: "green" | "yellow" = "green") => {
+  const resetAfterExit = (
+    message?: string,
+    color: "green" | "yellow" = "green",
+    opts?: { recordStopLossHit?: boolean },
+  ) => {
     if (exitClosed) {
       return;
     }
@@ -1142,6 +1255,10 @@ function checkStopLoss(
     state.position = null;
     state.stopLossFired = false;
     state.exitInProgress = false;
+
+    if (opts?.recordStopLossHit) {
+      recordStopLossHit();
+    }
 
     if (message) {
       ctx.log(message, color);
@@ -1154,9 +1271,11 @@ function checkStopLoss(
     }
 
     if (Date.now() >= ctx.slotEndMs) {
+      state.lastExitReason = null;
       resetAfterExit(
         `[${ctx.slug}] late-entry: exit abandoned — slot ended [${exitReason}]`,
         "yellow",
+        { recordStopLossHit: false },
       );
       return;
     }
@@ -1166,6 +1285,7 @@ function checkStopLoss(
       resetAfterExit(
         `[${ctx.slug}] late-entry: exit complete — remaining shares treated as dust (${targetShares.toFixed(6)}) [${exitReason}]`,
         "yellow",
+        { recordStopLossHit: true },
       );
       return;
     }
@@ -1202,6 +1322,7 @@ function checkStopLoss(
           resetAfterExit(
             `[${ctx.slug}] late-entry: exit SELL filled @ ${sellPrice} (${filledShares} shares)`,
             "green",
+            { recordStopLossHit: true },
           );
         },
         onExpired() {
@@ -1221,6 +1342,7 @@ function checkStopLoss(
             resetAfterExit(
               `[${ctx.slug}] late-entry: exit complete — remaining shares treated as dust (${latestTrackedShares.toFixed(6)}) [${exitReason}]`,
               "yellow",
+              { recordStopLossHit: true },
             );
             return;
           }
@@ -1238,6 +1360,7 @@ function checkStopLoss(
             resetAfterExit(
               `[${ctx.slug}] late-entry: exit stopped — remaining shares below executable size (${latestTrackedShares.toFixed(6)}) [${exitReason}]`,
               "yellow",
+              { recordStopLossHit: true },
             );
             return;
           }
@@ -1270,6 +1393,7 @@ export const lateEntry: Strategy = async (ctx) => {
     hadPosition: false,
     lastTradeSide: null,
     settlementPreviewLogged: false,
+    lastExitReason: null,
     released: false,
     signalConfirmTicks: 0,
   };
@@ -1293,9 +1417,16 @@ export const lateEntry: Strategy = async (ctx) => {
     // One-shot CLOB hint (no PnL): win_preview / loss_preview / uncertain — before early teardown.
     if (!state.settlementPreviewLogged && state.hadPosition) {
       const side = state.position?.side ?? state.lastTradeSide;
-      if (side) {
+      if (!side) {
+        ctx.log(
+          `[${ctx.slug}] late-entry: settlement-preview skipped — no side (lastTradeSide missing)`,
+          "yellow",
+        );
+        state.settlementPreviewLogged = true;
+      } else {
         const mid = midForOutcome(ctx, side);
-        const label = classifySettlementPreview(mid);
+        const { price, source } = signalPriceForSettlement(ctx, side);
+        const label = classifySettlementPreview(price);
         const fire =
           (remaining === 1 && state.position !== null) ||
           (remaining <= 5 &&
@@ -1307,7 +1438,27 @@ export const lateEntry: Strategy = async (ctx) => {
             state.hadPosition &&
             remaining > 5);
         if (fire) {
-          const totals = recordSettlementPreviewOutcome(label);
+          const afterProgrammaticExit = state.lastExitReason !== null;
+          const exitSnap = state.lastExitReason;
+          const totals = recordSettlementPreviewOutcome(label, {
+            afterProgrammaticExit,
+          });
+          const bidOnly = ctx.orderBook.bestBidPrice(side);
+          const hindsight = hindsightFromLabel(label);
+          if (exitSnap !== null) {
+            appendLateEntryResolutionRow({
+              iso: new Date().toISOString(),
+              slug: ctx.slug,
+              side,
+              exitReason: exitSnap,
+              label,
+              priceUsed: price?.toFixed(4) ?? "na",
+              priceSource: source,
+              mid: mid?.toFixed(4) ?? "na",
+              hindsight,
+            });
+            state.lastExitReason = null;
+          }
           const color =
             label === "win_preview"
               ? "green"
@@ -1316,8 +1467,20 @@ export const lateEntry: Strategy = async (ctx) => {
                 : label === "no_book"
                   ? "yellow"
                   : "dim";
+          const lossesInclStops = totals.losses + totals.stopLossHits;
+          const tradeHint = afterProgrammaticExit
+            ? ` this_trade_hindsight=${hindsight}`
+            : "";
           ctx.log(
-            `[${ctx.slug}] late-entry: settlement-preview side=${side} mid=${mid?.toFixed(4) ?? "n/a"} label=${label} preview_wins=${totals.wins} preview_losses=${totals.losses} (mid>=${SETTLEMENT_PREVIEW_WIN_MIN} win, mid<=${SETTLEMENT_PREVIEW_LOSS_MAX} loss)`,
+            `[${ctx.slug}] late-entry: settlement-preview side=${side} ` +
+              `bid=${bidOnly?.toFixed(4) ?? "n/a"} mid=${mid?.toFixed(4) ?? "n/a"} ` +
+              `price_used=${price?.toFixed(4) ?? "n/a"} source=${source} ` +
+              `threshold=${SETTLEMENT_PREVIEW_THRESHOLD} label=${label} ` +
+              `preview_wins=${totals.wins} preview_losses=${totals.losses} ` +
+              `stop_hits=${totals.stopLossHits} losses_incl_stops=${lossesInclStops} ` +
+              `stop_then_preview_win=${totals.stoppedThenPreviewWin} ` +
+              `stop_then_preview_loss=${totals.stoppedThenPreviewLoss}` +
+              tradeHint,
             color,
           );
           state.settlementPreviewLogged = true;
@@ -1325,9 +1488,14 @@ export const lateEntry: Strategy = async (ctx) => {
       }
     }
 
-    // Single-trade mode: stop only after we actually had a live position
-    // and that position has fully exited.
-    if (state.hadPosition && !state.position && !state.exitInProgress) {
+    // Single-trade mode: stop only after we actually had a live position,
+    // that position has fully exited, and settlement preview has logged.
+    if (
+      state.hadPosition &&
+      !state.position &&
+      !state.exitInProgress &&
+      state.settlementPreviewLogged
+    ) {
       clearInterval(tickInterval);
       if (!state.released) {
         state.released = true;
